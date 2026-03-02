@@ -15,111 +15,135 @@
         // --- INITIALIZATION ---
         const canvas = document.getElementById('screen');
         const ctx = canvas.getContext('2d');
-    
+
         let width = window.innerWidth;
         let height = window.innerHeight;
         canvas.width = width;
         canvas.height = height;
-    
+
         let frameBuffer = ctx.createImageData(width, height);
-        let data = frameBuffer.data; // The 8-bit view (r, g, b, a)
-    
-        // OPTIMIZATION: Create a 32-bit view of the array.
-        // This lets us write a whole pixel (4 bytes) in one operation
-        // or clear the screen 4x faster.
+        let data = frameBuffer.data;
         let buf32 = new Uint32Array(data.buffer);
-    
+
         // --- LOW LEVEL FUNCTIONS ---
-    
-        // Optimized putPixel using the 32-bit buffer
-        // Color is packed as 0xAABBGGRR (little-endian architecture standard)
         function putPixel(x, y, color) {
-            // Floor coordinates to ensure integers
-            x = x | 0; 
-            y = y | 0;
-            
+            x = x | 0; y = y | 0;
             if (x < 0 || x >= width || y < 0 || y >= height) return;
-            
-            // Calculate index: y * width + x
             buf32[y * width + x] = color;
         }
-    
-        // Fast Screen Clear
-        // 0xFF000000 is Opaque Black (Alpha=255, B=0, G=0, R=0)
+
         function clearBuffer(color = 0xFF000000) {
             buf32.fill(color);
         }
-    
-        // Bresenham's Line Algorithm
-        // Draws a line from (x0, y0) to (x1, y1)
+
         function drawLine(x0, y0, x1, y1, color) {
-            x0 |= 0; y0 |= 0; x1 |= 0; y1 |= 0; // Force integers
-        
-            let dx = Math.abs(x1 - x0);
-            let dy = Math.abs(y1 - y0);
-            let sx = (x0 < x1) ? 1 : -1;
-            let sy = (y0 < y1) ? 1 : -1;
+            x0 |= 0; y0 |= 0; x1 |= 0; y1 |= 0;
+            let dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
+            let sx = (x0 < x1) ? 1 : -1, sy = (y0 < y1) ? 1 : -1;
             let err = dx - dy;
-        
+
             while (true) {
                 putPixel(x0, y0, color);
-            
                 if (x0 === x1 && y0 === y1) break;
-            
                 let e2 = 2 * err;
                 if (e2 > -dy) { err -= dy; x0 += sx; }
                 if (e2 < dx)  { err += dx; y0 += sy; }
             }
         }
-    
-        // --- HELPER: Color Packer ---
-        // Converts r,g,b to a single 32-bit integer (0xAABBGGRR)
+
         function rgb(r, g, b) {
             return (255 << 24) | (b << 16) | (g << 8) | r;
         }
-    
+
+        // --- 3D GEOMETRY ---
+
+        // Fixed: Properly formatted arrays so comments don't swallow the data!
+        const vertices = [
+            [-1, -1, -1], [ 1, -1, -1], [ 1,  1, -1],[-1,  1, -1], // Front face
+            [-1, -1,  1],[ 1, -1,  1], [ 1,  1,  1], [-1,  1,  1]  // Back face
+        ];
+
+        const edges = [
+            [0, 1],[1, 2], [2, 3], [3, 0], // Front face edges
+            [4, 5], [5, 6], [6, 7], [7, 4], // Back face edges
+            [0, 4], [1, 5], [2, 6], [3, 7]  // Connecting lines
+        ];
+
+        // --- 3D MATH ENGINE ---
+
+        function rotate3D(x, y, z, pitch, yaw, roll) {
+            // Pitch (X-axis)
+            let cosX = Math.cos(pitch), sinX = Math.sin(pitch);
+            let y1 = y * cosX - z * sinX;
+            let z1 = y * sinX + z * cosX;
+
+            // Yaw (Y-axis)
+            let cosY = Math.cos(yaw), sinY = Math.sin(yaw);
+            let x2 = x * cosY + z1 * sinY;
+            let z2 = -x * sinY + z1 * cosY;
+
+            // Roll (Z-axis)
+            let cosZ = Math.cos(roll), sinZ = Math.sin(roll);
+            let x3 = x2 * cosZ - y1 * sinZ;
+            let y3 = x2 * sinZ + y1 * cosZ;
+
+            return[x3, y3, z2];
+        }
+
         // --- THE RENDER LOOP ---
-        
         let time = 0;
-    
+
         function draw() {
-            // 1. Clear screen (Opaque Black)
             clearBuffer(0xFF000000);
-        
-            // 2. Calculate center
+
             const cx = width / 2;
             const cy = height / 2;
-            const radius = Math.min(width, height) / 3;
-        
-            // 3. Draw a rotating starburst
-            // This tests lines at every angle to ensure no gaps
-            const lines = 60;
-            time += 0.02;
-        
-            for (let i = 0; i < lines; i++) {
-                const angle = (Math.PI * 2 * i / lines) + time;
-                
-                // Polar coordinates to Cartesian
-                const xEnd = cx + Math.cos(angle) * radius;
-                const yEnd = cy + Math.sin(angle) * radius;
-            
-                // Generate a nice gradient color based on angle
-                const r = Math.floor(127 + 127 * Math.sin(angle));
-                const g = Math.floor(127 + 127 * Math.cos(angle));
-                const b = 150;
-            
-                drawLine(cx, cy, xEnd, yEnd, rgb(r, g, b));
+            const fov = Math.min(width, height) * 0.8; 
+
+            time += 0.015;
+
+            // 1. Process all vertices
+            const projectedVertices =[];
+
+            for (let i = 0; i < vertices.length; i++) {
+                let [x, y, z] = vertices[i];
+
+                // Rotate
+                let [rx, ry, rz] = rotate3D(x, y, z, time, time * 0.8, time * 0.5);
+
+                // Push back into the screen (Translate Z)
+                rz += 4; 
+
+                // Perspective Divide
+                if (rz <= 0) rz = 0.01; 
+
+                let xProj = (rx / rz) * fov + cx;
+                let yProj = (ry / rz) * fov + cy;
+
+                projectedVertices.push([xProj, yProj]);
             }
-        
-            // 4. Push to canvas
+
+            // 2. Draw the edges
+            const wireColor = rgb(0, 255, 150);
+
+            for (let i = 0; i < edges.length; i++) {
+                const [v1, v2] = edges[i];
+
+                const x0 = projectedVertices[v1][0];
+                const y0 = projectedVertices[v1][1];
+                const x1 = projectedVertices[v2][0];
+                const y1 = projectedVertices[v2][1];
+
+                drawLine(x0, y0, x1, y1, wireColor);
+            }
+
             ctx.putImageData(frameBuffer, 0, 0);
             requestAnimationFrame(draw);
         }
-    
+
         // Start
         draw();
-    
-        // Resize handler
+
         window.addEventListener('resize', () => {
             width = window.innerWidth;
             height = window.innerHeight;
