@@ -20,7 +20,7 @@
 
     <script>
         // ==========================================
-        // 1. MATH LIBRARY
+        // 1. MATH LIBRARY (Added Orthographic Projection)
         // ==========================================
         const Mat4 = {
             create: () => new Float32Array(16).fill(0).map((_, i) => i % 5 === 0 ? 1 : 0),
@@ -28,6 +28,13 @@
                 let f = 1.0 / Math.tan(fovy / 2), nf = 1 / (near - far);
                 out.fill(0); out[0] = f / aspect; out[5] = f;
                 out[10] = (far + near) * nf; out[11] = -1; out[14] = (2 * far * near) * nf;
+                return out;
+            },
+            ortho: (out, left, right, bottom, top, near, far) => {
+                let lr = 1 / (left - right), bt = 1 / (bottom - top), nf = 1 / (near - far);
+                out.fill(0);
+                out[0] = -2 * lr; out[5] = -2 * bt; out[10] = 2 * nf;
+                out[12] = (left + right) * lr; out[13] = (top + bottom) * bt; out[14] = (far + near) * nf; out[15] = 1;
                 return out;
             },
             lookAt: (out, eye, center, up) => {
@@ -44,6 +51,14 @@
                 out[14] = -(z0*eye[0] + z1*eye[1] + z2*eye[2]); out[15] = 1;
                 return out;
             },
+            multiply: (out, a, b) => {
+                for(let i=0; i<4; i++) {
+                    for(let j=0; j<4; j++) {
+                        out[i*4+j] = a[i*4+0]*b[0+j] + a[i*4+1]*b[4+j] + a[i*4+2]*b[8+j] + a[i*4+3]*b[12+j];
+                    }
+                }
+                return out;
+            },
             fromRotationTranslationScale: (out, q, v, s) => {
                 let x2 = q[0] + q[0], y2 = q[1] + q[1], z2 = q[2] + q[2];
                 let xx = q[0] * x2, xy = q[0] * y2, xz = q[0] * z2;
@@ -58,78 +73,74 @@
         };
         
         // ==========================================
-        // 2. ECS CORE & COMPONENTS
+        // 2. ECS CORE (Unchanged)
         // ==========================================
         class World {
             constructor() { this.entities = 0; this.components = {}; }
             createEntity() { return ++this.entities; }
-            addComponent(entity, name, data) {
-                if (!this.components[name]) this.components[name] = {};
-                this.components[name][entity] = data;
-            }
-            getComponent(entity, name) { return this.components[name] ? this.components[name][entity] : null; }
-            query(...names) {
-                if (!this.components[names[0]]) return[];
-                let match = Object.keys(this.components[names[0]]);
-                for (let i = 1; i < names.length; i++) {
-                    match = match.filter(e => this.components[names[i]] && this.components[names[i]][e] !== undefined);
-                }
-                return match;
+            addComponent(e, n, d) { if (!this.components[n]) this.components[n] = {}; this.components[n][e] = d; }
+            getComponent(e, n) { return this.components[n] ? this.components[n][e] : null; }
+            query(...n) {
+                if (!this.components[n[0]]) return[];
+                let m = Object.keys(this.components[n[0]]);
+                for (let i = 1; i < n.length; i++) m = m.filter(e => this.components[n[i]] && this.components[n[i]][e] !== undefined);
+                return m;
             }
         }
         const engine = new World();
-        
-        function Transform(x=0, y=0, z=0) { return { position: [x, y, z], rotation:[0, 0, 0, 1], scale: [1, 1, 1], matrix: Mat4.create() }; }
-        // Asteroid component stores rotational velocity for the physics step
+        function Transform(x=0, y=0, z=0) { return { position:[x, y, z], rotation:[0, 0, 0, 1], scale:[1, 1, 1], matrix: Mat4.create() }; }
         function Asteroid(orbitSpeed, spinAxis, spinSpeed) { return { orbitSpeed, spinAxis, spinSpeed }; }
         function Material(r, g, b, metallic, roughness) { return { albedo:[r, g, b], metallic, roughness }; }
         
         // ==========================================
-        // 3. WEBGL2 INSTANCED SHADERS
+        // 3. WEBGL2 SHADERS (DEPTH + PBR + SHADOWS)
         // ==========================================
         const canvas = document.getElementById('screen');
         const gl = canvas.getContext('webgl2', { antialias: false });
-        const extColorBufferFloat = gl.getExtension("EXT_color_buffer_float");
+        const extFloat = gl.getExtension("EXT_color_buffer_float");
         
-        // Notice: u_model is GONE. Replaced by a_instanceMatrix (Attribute location 2)
-        // a_instanceMatrix takes up locations 2, 3, 4, 5 because mat4 is 4 vec4s.
-        const vsSource = `#version 300 es
-            layout(location = 0) in vec3 a_position; 
-            layout(location = 1) in vec3 a_normal;
-            layout(location = 2) in mat4 a_instanceMatrix;
-            layout(location = 6) in vec3 a_instanceAlbedo;
+        // --- SHADER: DEPTH ONLY (For Shadow Map) ---
+        const vsDepth = `#version 300 es
+            layout(location = 0) in vec3 a_position; layout(location = 2) in mat4 a_instanceMatrix;
+            uniform mat4 u_lightSpaceMatrix;
+            void main() { gl_Position = u_lightSpaceMatrix * a_instanceMatrix * vec4(a_position, 1.0); }`;
+        const fsDepth = `#version 300 es\n void main() {}`; // Empty. WebGL writes depth automatically!
+        
+        // --- SHADER: PBR WITH SHADOWS ---
+        const vsPbr = `#version 300 es
+            layout(location = 0) in vec3 a_position; layout(location = 1) in vec3 a_normal;
+            layout(location = 2) in mat4 a_instanceMatrix; layout(location = 6) in vec3 a_instanceAlbedo;
             
-            uniform mat4 u_view; uniform mat4 u_projection;
+            uniform mat4 u_view; uniform mat4 u_projection; uniform mat4 u_lightSpaceMatrix;
             
-            out vec3 v_worldPos; out vec3 v_normal; out vec3 v_albedo;
+            out vec3 v_worldPos; out vec3 v_normal; out vec3 v_albedo; out vec4 v_fragPosLightSpace;
             
             void main() {
                 vec4 worldPos = a_instanceMatrix * vec4(a_position, 1.0);
                 v_worldPos = worldPos.xyz;
                 v_normal = mat3(a_instanceMatrix) * a_normal; 
                 v_albedo = a_instanceAlbedo;
+                v_fragPosLightSpace = u_lightSpaceMatrix * worldPos; // Convert to Sun Space
                 gl_Position = u_projection * u_view * worldPos;
             }`;
         
-        const fsSource = `#version 300 es
+        const fsPbr = `#version 300 es
             precision highp float;
-            in vec3 v_worldPos; in vec3 v_normal; in vec3 v_albedo;
+            in vec3 v_worldPos; in vec3 v_normal; in vec3 v_albedo; in vec4 v_fragPosLightSpace;
             out vec4 outColor;
             
-            uniform vec3 u_camPos; uniform vec3 u_lightPos;
-            uniform float u_metallic; uniform float u_roughness;
+            uniform vec3 u_camPos; uniform vec3 u_lightDir;
+            uniform sampler2D u_shadowMap; // The depth texture!
             
             const float PI = 3.14159265359;
-            const vec3 lightColor = vec3(1200.0, 1100.0, 1000.0); // Intense Sun
+            const vec3 lightColor = vec3(2.5, 2.5, 2.4); // Directional Light Intensity
             
             float DistributionGGX(vec3 N, vec3 H, float r) {
                 float a2 = r*r*r*r; float NdotH = max(dot(N, H), 0.0);
-                float denom = (NdotH*NdotH * (a2 - 1.0) + 1.0);
-                return a2 / max(PI * denom * denom, 0.0000001);
+                float denom = (NdotH*NdotH * (a2 - 1.0) + 1.0); return a2 / max(PI * denom * denom, 0.0000001);
             }
             float GeometrySchlickGGX(float NdotV, float r) {
-                float k = ((r+1.0)*(r+1.0)) / 8.0;
-                return NdotV / (NdotV * (1.0 - k) + k);
+                float k = ((r+1.0)*(r+1.0)) / 8.0; return NdotV / (NdotV * (1.0 - k) + k);
             }
             float GeometrySmith(vec3 N, vec3 V, vec3 L, float r) {
                 return GeometrySchlickGGX(max(dot(N, L), 0.0), r) * GeometrySchlickGGX(max(dot(N, V), 0.0), r);
@@ -137,15 +148,39 @@
             vec3 fresnelSchlick(float cosT, vec3 F0) {
                 return F0 + (1.0 - F0) * pow(clamp(1.0 - cosT, 0.0, 1.0), 5.0);
             }
+        
+            // PCF (Percentage-Closer Filtering) Shadow Function
+            float ShadowCalculation(vec4 fragPosLightSpace, vec3 N, vec3 L) {
+                // Perspective divide & map to [0, 1] range
+                vec3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
+                projCoords = projCoords * 0.5 + 0.5;
+                if(projCoords.z > 1.0) return 0.0;
+                
+                float currentDepth = projCoords.z;
+                // Bias prevents "shadow acne" (stripes on surfaces)
+                float bias = max(0.005 * (1.0 - dot(N, L)), 0.0005);
+                
+                float shadow = 0.0;
+                vec2 texelSize = 1.0 / vec2(2048.0); // Size of one shadow pixel
+                
+                // Sample a 3x3 grid around the pixel to blur the shadow edges softly
+                for(int x = -1; x <= 1; ++x) {
+                    for(int y = -1; y <= 1; ++y) {
+                        float pcfDepth = texture(u_shadowMap, projCoords.xy + vec2(x, y) * texelSize).r; 
+                        shadow += currentDepth - bias > pcfDepth ? 1.0 : 0.0;        
+                    }    
+                }
+                return shadow / 9.0;
+            }
             
             void main() {
+                float u_metallic = 0.05; float u_roughness = 0.85; // Asteroid defaults
+                
                 vec3 N = normalize(v_normal); vec3 V = normalize(u_camPos - v_worldPos);
                 vec3 F0 = mix(vec3(0.04), v_albedo, u_metallic);
                 
-                vec3 L = normalize(u_lightPos - v_worldPos); vec3 H = normalize(V + L);
-                float distance = length(u_lightPos - v_worldPos);
-                float attenuation = 1.0 / (distance * distance);
-                vec3 radiance = lightColor * attenuation;
+                vec3 L = normalize(-u_lightDir); vec3 H = normalize(V + L);
+                vec3 radiance = lightColor; // Directional lights don't have attenuation!
                 
                 float NDF = DistributionGGX(N, H, u_roughness);   
                 float G   = GeometrySmith(N, V, L, u_roughness);      
@@ -155,42 +190,56 @@
                 vec3 kD = (vec3(1.0) - F) * (1.0 - u_metallic);	  
                 
                 vec3 Lo = (kD * v_albedo / PI + specular) * radiance * max(dot(N, L), 0.0);
-                vec3 ambient = vec3(0.01) * v_albedo; // Dark deep space
                 
-                outColor = vec4(ambient + Lo, 1.0);
+                // Calculate the physical shadow
+                float shadow = ShadowCalculation(v_fragPosLightSpace, N, L);
+                vec3 ambient = vec3(0.01) * v_albedo;
+                
+                // Light is blocked by the shadow!
+                outColor = vec4(ambient + (1.0 - shadow) * Lo, 1.0);
             }`;
         
-        // Post-Process Shaders (Unchanged)
+        // Post Process (Unchanged)
         const vsPost = `#version 300 es\nlayout(location=0) in vec2 a_pos; out vec2 v_texCoord; void main(){ gl_Position=vec4(a_pos,0.0,1.0); v_texCoord=a_pos*0.5+0.5; }`;
         const fsPost = `#version 300 es
             precision highp float; in vec2 v_texCoord; uniform sampler2D u_tex; out vec4 color;
             vec3 ACES(vec3 x) { return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0); }
             void main() {
-                vec3 c = vec3(texture(u_tex, vec2(v_texCoord.x+0.003, v_texCoord.y)).r, texture(u_tex, v_texCoord).g, texture(u_tex, vec2(v_texCoord.x-0.003, v_texCoord.y)).b);
+                vec3 c = texture(u_tex, v_texCoord).rgb;
                 c = pow(ACES(c), vec3(1.0/2.2));
-                color = vec4(c * (1.0 - dot(v_texCoord*2.-1., v_texCoord*2.-1.)*0.3), 1.0);
+                color = vec4(c * (1.0 - dot(v_texCoord*2.-1., v_texCoord*2.-1.)*0.2), 1.0);
             }`;
         
         function compile(t, s) { const sh=gl.createShader(t); gl.shaderSource(sh,s); gl.compileShader(sh); return sh; }
-        const pbrProg = gl.createProgram(); gl.attachShader(pbrProg, compile(gl.VERTEX_SHADER, vsSource)); gl.attachShader(pbrProg, compile(gl.FRAGMENT_SHADER, fsSource)); gl.linkProgram(pbrProg);
+        
+        const depthProg = gl.createProgram(); gl.attachShader(depthProg, compile(gl.VERTEX_SHADER, vsDepth)); gl.attachShader(depthProg, compile(gl.FRAGMENT_SHADER, fsDepth)); gl.linkProgram(depthProg);
+        const pbrProg = gl.createProgram(); gl.attachShader(pbrProg, compile(gl.VERTEX_SHADER, vsPbr)); gl.attachShader(pbrProg, compile(gl.FRAGMENT_SHADER, fsPbr)); gl.linkProgram(pbrProg);
         const postProg = gl.createProgram(); gl.attachShader(postProg, compile(gl.VERTEX_SHADER, vsPost)); gl.attachShader(postProg, compile(gl.FRAGMENT_SHADER, fsPost)); gl.linkProgram(postProg);
         
-        const locs = { view: gl.getUniformLocation(pbrProg, "u_view"), proj: gl.getUniformLocation(pbrProg, "u_projection"), camPos: gl.getUniformLocation(pbrProg, "u_camPos"), metallic: gl.getUniformLocation(pbrProg, "u_metallic"), roughness: gl.getUniformLocation(pbrProg, "u_roughness"), lightPos: gl.getUniformLocation(pbrProg, "u_lightPos") };
+        const pbrLocs = { 
+            view: gl.getUniformLocation(pbrProg, "u_view"), proj: gl.getUniformLocation(pbrProg, "u_projection"), 
+            camPos: gl.getUniformLocation(pbrProg, "u_camPos"), lightDir: gl.getUniformLocation(pbrProg, "u_lightDir"),
+            lightSpaceMat: gl.getUniformLocation(pbrProg, "u_lightSpaceMatrix"), shadowMap: gl.getUniformLocation(pbrProg, "u_shadowMap") 
+        };
+        const depthLocs = { lightSpaceMat: gl.getUniformLocation(depthProg, "u_lightSpaceMatrix") };
         
         // ==========================================
-        // 4. INSTANCING BUFFERS & FBO
+        // 4. FBOS (SHADOW MAP & HDR TARGET)
         // ==========================================
-        const INSTANCE_COUNT = 25000;
-        const matrixData = new Float32Array(INSTANCE_COUNT * 16);
-        const colorData = new Float32Array(INSTANCE_COUNT * 3);
+        const SHADOW_RES = 2048;
+        const shadowFBO = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO);
+        const shadowTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, SHADOW_RES, SHADOW_RES, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, shadowTex, 0);
         
-        // FBO Setup
         let targetFBO, targetTex, depthBuf;
         function setupFBO(w, h) {
             if(targetFBO) { gl.deleteFramebuffer(targetFBO); gl.deleteTexture(targetTex); gl.deleteRenderbuffer(depthBuf); }
             targetFBO = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, targetFBO);
             targetTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, targetTex);
-            gl.texImage2D(gl.TEXTURE_2D, 0, extColorBufferFloat ? gl.RGBA16F : gl.RGBA8, w, h, 0, gl.RGBA, extColorBufferFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null);
+            gl.texImage2D(gl.TEXTURE_2D, 0, extFloat ? gl.RGBA16F : gl.RGBA8, w, h, 0, gl.RGBA, extFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
             gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, targetTex, 0);
             depthBuf = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, depthBuf);
@@ -205,7 +254,7 @@
         gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
         
         // ==========================================
-        // 5. GEOMETRY (Low-Poly Icosahedron)
+        // 5. GEOMETRY & INSTANCING BUFFERS
         // ==========================================
         function createAsteroid() {
             let t = (1.0 + Math.sqrt(5.0)) / 2.0;
@@ -214,8 +263,7 @@
             let verts = [], norms =[];
             for(let j=0; j<i.length; j+=3) {
                 let p1=[v[i[j]*3], v[i[j]*3+1], v[i[j]*3+2]], p2=[v[i[j+1]*3], v[i[j+1]*3+1], v[i[j+1]*3+2]], p3=[v[i[j+2]*3], v[i[j+2]*3+1], v[i[j+2]*3+2]];
-                let ux=p2[0]-p1[0], uy=p2[1]-p1[1], uz=p2[2]-p1[2];
-                let vx=p3[0]-p1[0], vy=p3[1]-p1[1], vz=p3[2]-p1[2];
+                let ux=p2[0]-p1[0], uy=p2[1]-p1[1], uz=p2[2]-p1[2]; let vx=p3[0]-p1[0], vy=p3[1]-p1[1], vz=p3[2]-p1[2];
                 let nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
                 let l=Math.hypot(nx,ny,nz); nx/=l; ny/=l; nz/=l;
                 verts.push(...p1,...p2,...p3); norms.push(nx,ny,nz, nx,ny,nz, nx,ny,nz);
@@ -224,122 +272,118 @@
         }
         const astData = createAsteroid();
         
-        // Setup Instanced VAO
+        const INSTANCE_COUNT = 15000; // Lowered slightly to maintain 60FPS with double rendering pass
+        const matrixData = new Float32Array(INSTANCE_COUNT * 16);
+        const colorData = new Float32Array(INSTANCE_COUNT * 3);
+        
         const instVao = gl.createVertexArray(); gl.bindVertexArray(instVao);
-        const vBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vBuf);
-        gl.bufferData(gl.ARRAY_BUFFER, astData.verts, gl.STATIC_DRAW);
+        const vBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vBuf); gl.bufferData(gl.ARRAY_BUFFER, astData.verts, gl.STATIC_DRAW);
         gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-        const nBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, nBuf);
-        gl.bufferData(gl.ARRAY_BUFFER, astData.norms, gl.STATIC_DRAW);
+        const nBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, nBuf); gl.bufferData(gl.ARRAY_BUFFER, astData.norms, gl.STATIC_DRAW);
         gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
         
-        // Matrix Instancing Buffer (Locations 2, 3, 4, 5)
-        const matBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, matBuf);
-        gl.bufferData(gl.ARRAY_BUFFER, matrixData.byteLength, gl.DYNAMIC_DRAW);
-        for (let i = 0; i < 4; i++) {
-            gl.enableVertexAttribArray(2 + i);
-            gl.vertexAttribPointer(2 + i, 4, gl.FLOAT, false, 64, i * 16);
-            gl.vertexAttribDivisor(2 + i, 1); // <--- THE MAGIC INSTANCING FUNCTION
-        }
-        // Color Instancing Buffer (Location 6)
-        const colBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, colBuf);
-        gl.bufferData(gl.ARRAY_BUFFER, colorData.byteLength, gl.DYNAMIC_DRAW);
-        gl.enableVertexAttribArray(6); gl.vertexAttribPointer(6, 3, gl.FLOAT, false, 12, 0);
-        gl.vertexAttribDivisor(6, 1);
+        const matBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, matBuf); gl.bufferData(gl.ARRAY_BUFFER, matrixData.byteLength, gl.DYNAMIC_DRAW);
+        for (let i = 0; i < 4; i++) { gl.enableVertexAttribArray(2 + i); gl.vertexAttribPointer(2 + i, 4, gl.FLOAT, false, 64, i * 16); gl.vertexAttribDivisor(2 + i, 1); }
+        const colBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, colBuf); gl.bufferData(gl.ARRAY_BUFFER, colorData.byteLength, gl.DYNAMIC_DRAW);
+        gl.enableVertexAttribArray(6); gl.vertexAttribPointer(6, 3, gl.FLOAT, false, 12, 0); gl.vertexAttribDivisor(6, 1);
         
         // ==========================================
-        // 6. SCENE SETUP (25,000 ASTEROIDS)
+        // 6. SCENE SETUP
         // ==========================================
-        for (let i = 0; i < INSTANCE_COUNT; i++) {
+        
+        // Entity 0: The Central Planetoid (Massive, stationary)
+        const planet = engine.createEntity();
+        engine.addComponent(planet, 'Transform', Transform(0, 0, 0));
+        engine.getComponent(planet, 'Transform').scale =[15.0, 15.0, 15.0];
+        engine.addComponent(planet, 'Asteroid', Asteroid(0,[0,1,0], 0.1)); // Slow spin
+        engine.addComponent(planet, 'Material', Material(0.2, 0.4, 0.8, 0.1, 0.9)); // Blue-ish grey
+        
+        // Entities 1 to 14,999: The Asteroid Ring
+        for (let i = 1; i < INSTANCE_COUNT; i++) {
             const e = engine.createEntity();
-            
-            // Distribute in a massive Saturn-like ring
-            let radius = 20 + Math.random() * 80;
+            let radius = 25 + Math.random() * 60;
             let angle = Math.random() * Math.PI * 2;
-            let yOffset = (Math.random() - 0.5) * (Math.random() * 10);
-            
-            let x = Math.cos(angle) * radius;
-            let z = Math.sin(angle) * radius;
-            
+            let yOffset = (Math.random() - 0.5) * 8.0;
             let scale = 0.2 + Math.random() * 1.5;
-            
-            // Grey/Brown rocky colors
-            let c = 0.3 + Math.random() * 0.4;
-            let r = c + Math.random()*0.1, g = c, b = c - Math.random()*0.1;
+            let c = 0.4 + Math.random() * 0.4;
         
-            engine.addComponent(e, 'Transform', Transform(x, yOffset, z));
+            engine.addComponent(e, 'Transform', Transform(Math.cos(angle)*radius, yOffset, Math.sin(angle)*radius));
             engine.getComponent(e, 'Transform').scale =[scale, scale, scale];
-            engine.addComponent(e, 'Material', Material(r, g, b, 0.1, 0.9)); // Rough, non-metal rock
-            
-            // Physics data
-            let orbitSpeed = (1.0 / radius) * (Math.random() > 0.5 ? 1 : -1);
-            engine.addComponent(e, 'Asteroid', Asteroid(orbitSpeed,[Math.random(), Math.random(), Math.random()], Math.random() * 2.0));
+            engine.addComponent(e, 'Material', Material(c+0.1, c, c-0.1, 0.1, 0.9));
+            engine.addComponent(e, 'Asteroid', Asteroid((1.0 / radius) * (Math.random() > 0.5 ? 1 : -1), [Math.random(), Math.random(), Math.random()], Math.random() * 2.0));
         }
         
         // ==========================================
-        // 7. CAMERA CONTROLS
+        // 7. CAMERA
         // ==========================================
-        let camRadius = 60, camTheta = 0, camPhi = 1.0;
-        let isDragging = false, lastMouseX = 0, lastMouseY = 0;
-        window.addEventListener('mousedown', e => { isDragging = true; lastMouseX = e.clientX; lastMouseY = e.clientY; });
+        let camRadius = 80, camTheta = 0, camPhi = 1.0;
+        let isDragging = false, lastX = 0, lastY = 0;
+        window.addEventListener('mousedown', e => { isDragging = true; lastX = e.clientX; lastY = e.clientY; });
         window.addEventListener('mouseup', () => isDragging = false);
         window.addEventListener('mousemove', e => {
             if(!isDragging) return;
-            camTheta -= (e.clientX - lastMouseX) * 0.005;
-            camPhi += (e.clientY - lastMouseY) * 0.005;
-            camPhi = Math.max(0.1, Math.min(Math.PI - 0.1, camPhi));
-            lastMouseX = e.clientX; lastMouseY = e.clientY;
+            camTheta -= (e.clientX - lastX) * 0.005; camPhi += (e.clientY - lastY) * 0.005;
+            camPhi = Math.max(0.1, Math.min(Math.PI - 0.1, camPhi)); lastX = e.clientX; lastY = e.clientY;
         });
-        window.addEventListener('wheel', e => { camRadius += e.deltaY * 0.05; camRadius = Math.max(5, Math.min(150, camRadius)); });
+        window.addEventListener('wheel', e => { camRadius += e.deltaY * 0.05; camRadius = Math.max(20, Math.min(200, camRadius)); });
         
         // ==========================================
         // 8. RENDER LOOP
         // ==========================================
         const projMat = Mat4.create(), viewMat = Mat4.create();
+        const lightProj = Mat4.create(), lightView = Mat4.create(), lightSpaceMat = Mat4.create();
         
         function renderSystem(time, dt) {
-            let q = new Float32Array(4); // Temp quaternion
             let entities = engine.query('Transform', 'Asteroid', 'Material');
-            
             let idx = 0;
             for (let e of entities) {
-                let t = engine.getComponent(e, 'Transform');
-                let ast = engine.getComponent(e, 'Asteroid');
-                let mat = engine.getComponent(e, 'Material');
+                let t = engine.getComponent(e, 'Transform'), ast = engine.getComponent(e, 'Asteroid'), mat = engine.getComponent(e, 'Material');
+                
+                if (idx !== 0) { // Don't orbit the planet
+                    let currentAngle = Math.atan2(t.position[2], t.position[0]) + (ast.orbitSpeed * dt);
+                    let dist = Math.hypot(t.position[0], t.position[2]);
+                    t.position[0] = Math.cos(currentAngle) * dist; t.position[2] = Math.sin(currentAngle) * dist;
+                }
             
-                // Physics: Orbit the sun
-                let currentAngle = Math.atan2(t.position[2], t.position[0]) + (ast.orbitSpeed * dt);
-                let dist = Math.hypot(t.position[0], t.position[2]);
-                t.position[0] = Math.cos(currentAngle) * dist;
-                t.position[2] = Math.sin(currentAngle) * dist;
-            
-                // Physics: Spin on axis
-                let halfAngle = (time * ast.spinSpeed) * 0.5;
-                let s = Math.sin(halfAngle);
-                t.rotation[0] = ast.spinAxis[0] * s; t.rotation[1] = ast.spinAxis[1] * s; 
-                t.rotation[2] = ast.spinAxis[2] * s; t.rotation[3] = Math.cos(halfAngle);
+                let halfAngle = (time * ast.spinSpeed) * 0.5, s = Math.sin(halfAngle);
+                t.rotation[0] = ast.spinAxis[0]*s; t.rotation[1] = ast.spinAxis[1]*s; 
+                t.rotation[2] = ast.spinAxis[2]*s; t.rotation[3] = Math.cos(halfAngle);
             
                 Mat4.fromRotationTranslationScale(t.matrix, t.rotation, t.position, t.scale);
-                
-                // Pack data into flat arrays for the GPU
-                matrixData.set(t.matrix, idx * 16);
-                colorData.set(mat.albedo, idx * 3);
-                idx++;
+                matrixData.set(t.matrix, idx * 16); colorData.set(mat.albedo, idx * 3); idx++;
             }
         
-            // Upload massive array to GPU instantly
             gl.bindBuffer(gl.ARRAY_BUFFER, matBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, matrixData);
             gl.bindBuffer(gl.ARRAY_BUFFER, colBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, colorData);
         
-            // --- RENDER PASS ---
+            // --- LIGHT MATH ---
+            // Make the sun slowly orbit the scene to see shadows moving dynamically
+            const lightDir = normalize([-Math.sin(time*0.2), -1.0, -Math.cos(time*0.2)]);
+            const lightDist = 100.0;
+            const lightPos =[lightDir[0]* -lightDist, lightDir[1]* -lightDist, lightDir[2]* -lightDist];
+            
+            // Ortho bounds must encapsulate the entire asteroid ring (radius ~85)
+            Mat4.ortho(lightProj, -90, 90, -90, 90, 1.0, 200.0);
+            Mat4.lookAt(lightView, lightPos, [0, 0, 0], [0, 1, 0]);
+            Mat4.multiply(lightSpaceMat, lightProj, lightView);
+        
+            // --- PASS 1: SHADOW MAP ---
+            gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO);
+            gl.viewport(0, 0, SHADOW_RES, SHADOW_RES);
+            gl.enable(gl.DEPTH_TEST); gl.clear(gl.DEPTH_BUFFER_BIT); // No color bit needed!
+        
+            gl.useProgram(depthProg);
+            gl.uniformMatrix4fv(depthLocs.lightSpaceMat, false, lightSpaceMat);
+            gl.bindVertexArray(instVao);
+            gl.drawArraysInstanced(gl.TRIANGLES, 0, astData.verts.length / 3, INSTANCE_COUNT);
+        
+            // --- PASS 2: BEAUTY (PBR) PASS ---
             gl.bindFramebuffer(gl.FRAMEBUFFER, targetFBO);
             gl.viewport(0, 0, canvas.width, canvas.height);
             gl.clearColor(0.01, 0.01, 0.02, 1.0);
-            gl.enable(gl.DEPTH_TEST);
             gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
         
             gl.useProgram(pbrProg);
-            
             let cx = Math.sin(camPhi)*Math.cos(camTheta)*camRadius;
             let cy = Math.cos(camPhi)*camRadius;
             let cz = Math.sin(camPhi)*Math.sin(camTheta)*camRadius;
@@ -347,18 +391,20 @@
             Mat4.perspective(projMat, Math.PI / 4, canvas.width / canvas.height, 0.1, 300.0);
             Mat4.lookAt(viewMat, [cx, cy, cz], [0, 0, 0],[0, 1, 0]);
         
-            gl.uniformMatrix4fv(locs.proj, false, projMat);
-            gl.uniformMatrix4fv(locs.view, false, viewMat);
-            gl.uniform3fv(locs.camPos, [cx, cy, cz]);
-            gl.uniform3fv(locs.lightPos, [0, 0, 0]); // Sun in center
-            gl.uniform1f(locs.metallic, 0.1);
-            gl.uniform1f(locs.roughness, 0.9);
+            gl.uniformMatrix4fv(pbrLocs.proj, false, projMat);
+            gl.uniformMatrix4fv(pbrLocs.view, false, viewMat);
+            gl.uniformMatrix4fv(pbrLocs.lightSpaceMat, false, lightSpaceMat);
+            gl.uniform3fv(pbrLocs.camPos, [cx, cy, cz]);
+            gl.uniform3fv(pbrLocs.lightDir, lightDir);
+            
+            // Bind Shadow Map to Texture Unit 0
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+            gl.uniform1i(pbrLocs.shadowMap, 0);
         
-            gl.bindVertexArray(instVao);
-            // DRAW 25,000 ASTEROIDS IN ONE LINE OF CODE
             gl.drawArraysInstanced(gl.TRIANGLES, 0, astData.verts.length / 3, INSTANCE_COUNT);
         
-            // --- POST PROCESS PASS ---
+            // --- PASS 3: POST PROCESS ---
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
             gl.disable(gl.DEPTH_TEST);
             gl.useProgram(postProg);
@@ -367,14 +413,16 @@
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         }
         
+        // Helper vector math
+        function normalize(v) { let l = Math.hypot(v[0],v[1],v[2]); return [v[0]/l, v[1]/l, v[2]/l]; }
+        
         // ==========================================
-        // 8. LOOP
+        // 9. BOOTSTRAP
         // ==========================================
         let lastTime = performance.now(), frames = 0, lastFpsUpdate = lastTime;
         function loop(now) {
-            let dt = (now - lastTime) / 1000.0;
-            if(dt > 0.1) dt = 0.016;
-            frames++; if (now - lastFpsUpdate > 1000) { document.title = `JS Engine | FPS: ${frames} | Objects: 25k`; frames = 0; lastFpsUpdate = now; }
+            let dt = (now - lastTime) / 1000.0; if(dt > 0.1) dt = 0.016;
+            frames++; if (now - lastFpsUpdate > 1000) { document.title = `JS Engine | FPS: ${frames} | Objects: 15k | Soft Shadows`; frames = 0; lastFpsUpdate = now; }
             renderSystem(now * 0.001, dt);
             lastTime = now;
             requestAnimationFrame(loop);
