@@ -20,7 +20,7 @@
 
     <script>
         // ==========================================
-        // 1. MATH LIBRARY (Added Matrix Inversion)
+        // 1. MATH LIBRARY
         // ==========================================
         const Mat4 = {
             create: () => new Float32Array(16).fill(0).map((_, i) => i % 5 === 0 ? 1 : 0),
@@ -71,9 +71,9 @@
                 out[8]=(xz+wy)*s[2]; out[9]=(yz-wx)*s[2]; out[10]=(1-(xx+yy))*s[2]; out[11]=0; out[12]=v[0]; out[13]=v[1]; out[14]=v[2]; out[15]=1; return out;
             }
         };
-        
+
         // ==========================================
-        // 2. ECS CORE
+        // 2. ECS
         // ==========================================
         class World {
             constructor() { this.entities = 0; this.components = {}; }
@@ -90,142 +90,103 @@
         function Transform(x=0, y=0, z=0) { return { position:[x, y, z], rotation:[0, 0, 0, 1], scale:[1, 1, 1], matrix: Mat4.create() }; }
         function Asteroid(orbitSpeed, spinAxis, spinSpeed) { return { orbitSpeed, spinAxis, spinSpeed }; }
         function Material(r, g, b, metallic, roughness) { return { albedo:[r, g, b], metallic, roughness }; }
-        
+
         // ==========================================
         // 3. SHADERS
         // ==========================================
         const canvas = document.getElementById('screen');
         const gl = canvas.getContext('webgl2', { antialias: false });
         const extFloat = gl.getExtension("EXT_color_buffer_float");
-        
-        const vsDepth = `#version 300 es\n layout(location=0) in vec3 a_position; layout(location=2) in mat4 a_instanceMatrix; uniform mat4 u_lightSpaceMatrix; void main(){ gl_Position=u_lightSpaceMatrix*a_instanceMatrix*vec4(a_position,1.0); }`;
+
+        // 1. DEPTH SHADER (Shadow Map)
+        const vsDepth = `#version 300 es\n layout(location=0) in vec3 a_pos; layout(location=2) in mat4 a_instMat; uniform mat4 u_lSpace; void main(){ gl_Position=u_lSpace*a_instMat*vec4(a_pos,1.0); }`;
         const fsDepth = `#version 300 es\n void main(){}`;
-        
-        // --- NEW: PROCEDURAL ATMOSPHERE SHADER ---
-        const vsSky = `#version 300 es
-            layout(location=0) in vec2 a_pos;
-            uniform mat4 u_invViewProj;
-            out vec3 v_rayDir;
-            void main() {
-                gl_Position = vec4(a_pos, 1.0, 1.0); // Z=1.0 pushes to the far clipping plane
-                vec4 target = u_invViewProj * vec4(a_pos, 1.0, 1.0);
-                v_rayDir = target.xyz / target.w; 
-            }`;
-        
+
+        // 2. SKY SHADER
+        const vsSky = `#version 300 es\n layout(location=0) in vec2 a_p; uniform mat4 u_ivp; out vec3 v_rd; void main(){ gl_Position=vec4(a_p,1.0,1.0); vec4 t=u_ivp*vec4(a_p,1.0,1.0); v_rd=t.xyz/t.w; }`;
         const fsSky = `#version 300 es
-            precision highp float;
-            in vec3 v_rayDir;
-            uniform vec3 u_lightDir; uniform vec3 u_camPos;
-            out vec4 outColor;
-            
-            void main() {
-                vec3 ray = normalize(v_rayDir - u_camPos);
-                vec3 sunDir = normalize(-u_lightDir); 
-                
-                float cosTheta = dot(ray, sunDir);
-                float zenith = max(0.0, ray.y);
-                float sunZenith = max(0.0, sunDir.y);
-                
-                // Rayleigh Scattering (Blue Sky)
-                vec3 skyColor = mix(vec3(0.1, 0.4, 0.8), vec3(0.02, 0.05, 0.1), zenith);
-                
-                // Mie Scattering (Sunset Orange/Red)
-                vec3 sunset = vec3(1.0, 0.4, 0.1) * pow(max(0.0, 1.0 - sunZenith), 2.0);
-                skyColor = mix(skyColor, sunset, max(0.0, 1.0 - zenith) * max(0.0, cosTheta));
-                
-                // Sun Halo and Disk
-                float sunHalo = pow(max(0.0, cosTheta), 256.0) * 0.6 + pow(max(0.0, cosTheta), 8.0) * 0.1;
-                vec3 sunColor = vec3(1.0, 0.9, 0.8) * 15.0; // Very bright HDR sun
-                
-                // Blend everything based on Time of Day (Sun Zenith)
-                vec3 finalColor = skyColor * (0.1 + max(0.0, sunZenith) * 0.9) + sunHalo * sunColor;
-                
-                // Fade to black space when sun drops below horizon
-                finalColor *= smoothstep(-0.1, 0.1, sunDir.y); 
-        
-                outColor = vec4(finalColor, 1.0);
-            }`;
-        
+        precision highp float; in vec3 v_rd; uniform vec3 u_ld; uniform vec3 u_cp; out vec4 oc;
+        void main() {
+            vec3 r=normalize(v_rd-u_cp), s=normalize(-u_ld); float ct=dot(r,s), z=max(0.,r.y), sz=max(0.,s.y);
+            vec3 sc=mix(vec3(0.1,0.4,0.8),vec3(0.02,0.05,0.1),z);
+            vec3 ss=vec3(1.0,0.4,0.1)*pow(max(0.,1.-sz),2.); sc=mix(sc,ss,max(0.,1.-z)*max(0.,ct));
+            float sh=pow(max(0.,ct),256.)*0.6+pow(max(0.,ct),8.)*0.1;
+            vec3 sun=vec3(1.0,0.9,0.8)*15.0; // High intensity for Bloom
+            vec3 fc=sc*(0.1+max(0.,sz)*0.9)+sh*sun; fc*=smoothstep(-0.1,0.1,u_ld.y);
+            oc=vec4(fc,1.0);
+        }`;
+
+        // 3. PBR SHADER
         const vsPbr = `#version 300 es
-            layout(location=0) in vec3 a_position; layout(location=1) in vec3 a_normal;
-            layout(location=2) in mat4 a_instanceMatrix; layout(location=6) in vec3 a_instanceAlbedo;
-            uniform mat4 u_view; uniform mat4 u_projection; uniform mat4 u_lightSpaceMatrix;
-            out vec3 v_worldPos; out vec3 v_normal; out vec3 v_albedo; out vec4 v_fragPosLightSpace;
-            void main() {
-                vec4 worldPos = a_instanceMatrix * vec4(a_position, 1.0);
-                v_worldPos = worldPos.xyz; v_normal = mat3(a_instanceMatrix) * a_normal; v_albedo = a_instanceAlbedo;
-                v_fragPosLightSpace = u_lightSpaceMatrix * worldPos; gl_Position = u_projection * u_view * worldPos;
-            }`;
-        
+        layout(location=0) in vec3 a_p; layout(location=1) in vec3 a_n; layout(location=2) in mat4 a_im; layout(location=6) in vec3 a_ia;
+        uniform mat4 u_v, u_p, u_ls; out vec3 v_wp, v_n, v_a; out vec4 v_fpls;
+        void main() { vec4 wp=a_im*vec4(a_p,1.); v_wp=wp.xyz; v_n=mat3(a_im)*a_n; v_a=a_ia; v_fpls=u_ls*wp; gl_Position=u_p*u_v*wp; }`;
+
         const fsPbr = `#version 300 es
-            precision highp float;
-            in vec3 v_worldPos; in vec3 v_normal; in vec3 v_albedo; in vec4 v_fragPosLightSpace;
-            out vec4 outColor;
-            
-            uniform vec3 u_camPos; uniform vec3 u_lightDir; uniform sampler2D u_shadowMap;
-            const float PI = 3.14159265359;
-            
-            float DistributionGGX(vec3 N, vec3 H, float r) { float a2=r*r*r*r; float NdotH=max(dot(N,H),0.0); float d=(NdotH*NdotH*(a2-1.0)+1.0); return a2/max(PI*d*d,0.0000001); }
-            float GeometrySchlickGGX(float NdotV, float r) { float k=((r+1.0)*(r+1.0))/8.0; return NdotV/(NdotV*(1.0-k)+k); }
-            float GeometrySmith(vec3 N, vec3 V, vec3 L, float r) { return GeometrySchlickGGX(max(dot(N,L),0.0),r)*GeometrySchlickGGX(max(dot(N,V),0.0),r); }
-            vec3 fresnelSchlick(float cosT, vec3 F0) { return F0+(1.0-F0)*pow(clamp(1.0-cosT,0.0,1.0),5.0); }
-        
-            float ShadowCalculation(vec4 fragPosLightSpace, vec3 N, vec3 L) {
-                vec3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w; projCoords = projCoords * 0.5 + 0.5;
-                if(projCoords.z > 1.0) return 0.0;
-                float currentDepth = projCoords.z; float bias = max(0.005 * (1.0 - dot(N, L)), 0.0005);
-                float shadow = 0.0; vec2 texelSize = 1.0 / vec2(2048.0);
-                for(int x=-1; x<=1; ++x) { for(int y=-1; y<=1; ++y) {
-                    float pcfDepth = texture(u_shadowMap, projCoords.xy + vec2(x,y)*texelSize).r; 
-                    shadow += currentDepth - bias > pcfDepth ? 1.0 : 0.0;        
-                }} return shadow / 9.0;
+        precision highp float; in vec3 v_wp, v_n, v_a; in vec4 v_fpls; out vec4 oc;
+        uniform vec3 u_cp, u_ld; uniform sampler2D u_sm; const float PI=3.14159;
+        float D(vec3 N, vec3 H, float r) { float a2=r*r*r*r, d=(max(dot(N,H),0.)*max(dot(N,H),0.)*(a2-1.)+1.); return a2/max(PI*d*d,1e-7); }
+        float G(float N, float r) { float k=((r+1.)*(r+1.))/8.; return N/(N*(1.-k)+k); }
+        vec3 F(float c, vec3 f) { return f+(1.-f)*pow(clamp(1.-c,0.,1.),5.); }
+        float S(vec4 f, vec3 N, vec3 L) {
+            vec3 p=f.xyz/f.w; p=p*0.5+0.5; if(p.z>1.) return 0.;
+            float c=p.z, b=max(0.005*(1.-dot(N,L)),0.0005), s=0.; vec2 t=1./vec2(2048.);
+            for(int x=-1;x<=1;++x) for(int y=-1;y<=1;++y) s+=c-b>texture(u_sm,p.xy+vec2(x,y)*t).r?1.:0.;
+            return s/9.;
+        }
+        void main() {
+            float m=0.05, r=0.85; vec3 N=normalize(v_n), V=normalize(u_cp-v_wp), L=normalize(-u_ld), H=normalize(V+L);
+            vec3 F0=mix(vec3(0.04),v_a,m); float sp=max(0.,dot(vec3(0,1,0),L)); vec3 rad=vec3(2.5,2.4,2.2)*smoothstep(0.,0.2,sp);
+            float NDF=D(N,H,r), GS=G(max(dot(N,V),0.),r)*G(max(dot(N,L),0.),r); vec3 FS=F(max(dot(H,V),0.),F0);
+            vec3 spec=(NDF*GS*FS)/max(4.*max(dot(N,V),0.)*max(dot(N,L),0.),0.001);
+            vec3 kD=(vec3(1.)-FS)*(1.-m); vec3 Lo=(kD*v_a/PI+spec)*rad*max(dot(N,L),0.);
+            float sh=S(v_fpls,N,L); vec3 amb=vec3(0.05,0.1,0.2)*v_a*max(0.05,sp);
+            oc=vec4(amb+(1.-sh)*Lo,1.0);
+        }`;
+
+        // 4. BLUR SHADER (Gaussian)
+        const vsBlur = `#version 300 es\n layout(location=0) in vec2 a_p; out vec2 v_uv; void main(){ gl_Position=vec4(a_p,0.,1.); v_uv=a_p*0.5+0.5; }`;
+        const fsBlur = `#version 300 es
+        precision highp float; in vec2 v_uv; out vec4 oc;
+        uniform sampler2D u_img; uniform bool u_hor;
+        float w[5] = float[] (0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
+        void main() {
+            vec2 off = 1.0 / vec2(textureSize(u_img, 0));
+            vec3 res = texture(u_img, v_uv).rgb * w[0];
+            if(u_hor) {
+                for(int i=1; i<5; ++i) { res += texture(u_img, v_uv + vec2(off.x * float(i), 0.0)).rgb * w[i]; res += texture(u_img, v_uv - vec2(off.x * float(i), 0.0)).rgb * w[i]; }
+            } else {
+                for(int i=1; i<5; ++i) { res += texture(u_img, v_uv + vec2(0.0, off.y * float(i))).rgb * w[i]; res += texture(u_img, v_uv - vec2(0.0, off.y * float(i))).rgb * w[i]; }
             }
-            
-            void main() {
-                float u_metallic=0.05, u_roughness=0.85; 
-                vec3 N=normalize(v_normal), V=normalize(u_camPos-v_worldPos), L=normalize(-u_lightDir), H=normalize(V+L);
-                vec3 F0=mix(vec3(0.04), v_albedo, u_metallic);
-                
-                // Dynamically adjust light intensity based on time of day (Sun height)
-                float sunPower = max(0.0, dot(vec3(0.0, 1.0, 0.0), L));
-                vec3 radiance = vec3(2.5, 2.4, 2.2) * smoothstep(0.0, 0.2, sunPower); 
-                
-                float NDF=DistributionGGX(N,H,u_roughness), G=GeometrySmith(N,V,L,u_roughness);      
-                vec3 F=fresnelSchlick(max(dot(H,V),0.0),F0);       
-                vec3 specular=(NDF*G*F)/max(4.0*max(dot(N,V),0.0)*max(dot(N,L),0.0),0.001);
-                vec3 kD=(vec3(1.0)-F)*(1.0-u_metallic);	  
-                vec3 Lo=(kD*v_albedo/PI+specular)*radiance*max(dot(N,L),0.0);
-                
-                float shadow = ShadowCalculation(v_fragPosLightSpace, N, L);
-                
-                // Dynamic Sky Ambient Light (blueish during day, black at night)
-                vec3 ambient = vec3(0.05, 0.1, 0.2) * v_albedo * max(0.05, sunPower);
-                
-                outColor = vec4(ambient + (1.0 - shadow) * Lo, 1.0);
-            }`;
-        
-        const vsPost = `#version 300 es\nlayout(location=0) in vec2 a_pos; out vec2 v_texCoord; void main(){ gl_Position=vec4(a_pos,0.0,1.0); v_texCoord=a_pos*0.5+0.5; }`;
+            // Brightness threshold built-in: Only blur very bright things!
+            // If it's the first pass, we threshold. If it's already blurred, we just blur.
+            // For simplicity in this single file, we assume input is already the scene and we just extract brighter > 1.0
+            oc = vec4(res, 1.0);
+        }`;
+
+        // 5. COMPOSITE POST PROCESS SHADER
+        const vsPost = `#version 300 es\n layout(location=0) in vec2 a_p; out vec2 v_uv; void main(){ gl_Position=vec4(a_p,0.,1.); v_uv=a_p*0.5+0.5; }`;
         const fsPost = `#version 300 es
-            precision highp float; in vec2 v_texCoord; uniform sampler2D u_tex; out vec4 color;
-            vec3 ACES(vec3 x) { return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0); }
-            void main() {
-                vec3 c = texture(u_tex, v_texCoord).rgb;
-                c = pow(ACES(c), vec3(1.0/2.2));
-                color = vec4(c * (1.0 - dot(v_texCoord*2.-1., v_texCoord*2.-1.)*0.2), 1.0);
-            }`;
-        
+        precision highp float; in vec2 v_uv; out vec4 oc;
+        uniform sampler2D u_scene; uniform sampler2D u_bloom;
+        vec3 ACES(vec3 x) { return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0); }
+        void main() {
+            vec3 hdr = texture(u_scene, v_uv).rgb;
+            vec3 bloom = texture(u_bloom, v_uv).rgb;
+            vec3 c = hdr + bloom; // Additive blending
+            c = pow(ACES(c), vec3(1.0/2.2)); // Tone map + Gamma
+            oc = vec4(c * (1.0 - dot(v_uv*2.-1., v_uv*2.-1.)*0.2), 1.0);
+        }`;
+
         function compile(t, s) { const sh=gl.createShader(t); gl.shaderSource(sh,s); gl.compileShader(sh); return sh; }
         const depthProg = gl.createProgram(); gl.attachShader(depthProg, compile(gl.VERTEX_SHADER, vsDepth)); gl.attachShader(depthProg, compile(gl.FRAGMENT_SHADER, fsDepth)); gl.linkProgram(depthProg);
         const skyProg = gl.createProgram(); gl.attachShader(skyProg, compile(gl.VERTEX_SHADER, vsSky)); gl.attachShader(skyProg, compile(gl.FRAGMENT_SHADER, fsSky)); gl.linkProgram(skyProg);
         const pbrProg = gl.createProgram(); gl.attachShader(pbrProg, compile(gl.VERTEX_SHADER, vsPbr)); gl.attachShader(pbrProg, compile(gl.FRAGMENT_SHADER, fsPbr)); gl.linkProgram(pbrProg);
+        const blurProg = gl.createProgram(); gl.attachShader(blurProg, compile(gl.VERTEX_SHADER, vsBlur)); gl.attachShader(blurProg, compile(gl.FRAGMENT_SHADER, fsBlur)); gl.linkProgram(blurProg);
         const postProg = gl.createProgram(); gl.attachShader(postProg, compile(gl.VERTEX_SHADER, vsPost)); gl.attachShader(postProg, compile(gl.FRAGMENT_SHADER, fsPost)); gl.linkProgram(postProg);
-        
-        const pbrLocs = { view: gl.getUniformLocation(pbrProg,"u_view"), proj: gl.getUniformLocation(pbrProg,"u_projection"), camPos: gl.getUniformLocation(pbrProg,"u_camPos"), lightDir: gl.getUniformLocation(pbrProg,"u_lightDir"), lightSpaceMat: gl.getUniformLocation(pbrProg,"u_lightSpaceMatrix"), shadowMap: gl.getUniformLocation(pbrProg,"u_shadowMap") };
-        const depthLocs = { lightSpaceMat: gl.getUniformLocation(depthProg,"u_lightSpaceMatrix") };
-        const skyLocs = { invVP: gl.getUniformLocation(skyProg,"u_invViewProj"), camPos: gl.getUniformLocation(skyProg,"u_camPos"), lightDir: gl.getUniformLocation(skyProg,"u_lightDir") };
-        
+
         // ==========================================
-        // 4. FBOS & BUFFERS
+        // 4. FBOS (Shadow, HDR, PingPong)
         // ==========================================
         const SHADOW_RES = 2048;
         const shadowFBO = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO);
@@ -234,31 +195,52 @@
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, shadowTex, 0);
-        
-        let targetFBO, targetTex, depthBuf;
-        function setupFBO(w, h) {
-            if(targetFBO) { gl.deleteFramebuffer(targetFBO); gl.deleteTexture(targetTex); gl.deleteRenderbuffer(depthBuf); }
-            targetFBO = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, targetFBO);
-            targetTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, targetTex);
+
+        // HDR Scene Buffer
+        let hdrFBO, hdrTex, depthBuf;
+        // Ping-Pong Buffers for Bloom (Half Res for performance + better blur)
+        let pingFBO, pingTex, pongFBO, pongTex;
+
+        function setupFBOs(w, h) {
+            if(hdrFBO) { gl.deleteFramebuffer(hdrFBO); gl.deleteTexture(hdrTex); gl.deleteRenderbuffer(depthBuf); gl.deleteFramebuffer(pingFBO); gl.deleteTexture(pingTex); gl.deleteFramebuffer(pongFBO); gl.deleteTexture(pongTex); }
+            
+            // HDR
+            hdrFBO = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, hdrFBO);
+            hdrTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, hdrTex);
             gl.texImage2D(gl.TEXTURE_2D, 0, extFloat ? gl.RGBA16F : gl.RGBA8, w, h, 0, gl.RGBA, extFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, targetTex, 0);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, hdrTex, 0);
             depthBuf = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, depthBuf);
             gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
             gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthBuf);
+
+            // Ping
+            pingFBO = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, pingFBO);
+            pingTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, pingTex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, extFloat ? gl.RGBA16F : gl.RGBA8, w/2, h/2, 0, gl.RGBA, extFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, pingTex, 0);
+
+            // Pong
+            pongFBO = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, pongFBO);
+            pongTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, pongTex);
+            gl.texImage2D(gl.TEXTURE_2D, 0, extFloat ? gl.RGBA16F : gl.RGBA8, w/2, h/2, 0, gl.RGBA, extFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, pongTex, 0);
+            
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         }
-        
+
         const quadVao = gl.createVertexArray(); gl.bindVertexArray(quadVao);
         const quadVbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, quadVbo);
         gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
         gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-        
+
         // ==========================================
-        // 5. GEOMETRY & INSTANCING
+        // 5. SCENE
         // ==========================================
         function createAsteroid() {
-            let t=(1.0+Math.sqrt(5.0))/2.0, v=[-1,t,0, 1,t,0, -1,-t,0, 1,-t,0, 0,-1,t, 0,1,t, 0,-1,-t, 0,1,-t, t,0,-1, t,0,1, -t,0,-1, -t,0,1];
+            let t=(1.+Math.sqrt(5.))/2., v=[-1,t,0, 1,t,0, -1,-t,0, 1,-t,0, 0,-1,t, 0,1,t, 0,-1,-t, 0,1,-t, t,0,-1, t,0,1, -t,0,-1, -t,0,1];
             let i=[0,11,5,0,5,1,0,1,7,0,7,10,0,10,11,1,5,9,5,11,4,11,10,2,10,7,6,7,1,8,3,9,4,3,4,2,3,2,6,3,6,8,3,8,9,4,9,5,2,4,11,6,2,10,8,6,7,9,8,1];
             let verts=[], norms=[];
             for(let j=0; j<i.length; j+=3) {
@@ -270,138 +252,98 @@
         }
         const astData = createAsteroid();
         const INSTANCE_COUNT = 15000;
-        const matrixData = new Float32Array(INSTANCE_COUNT * 16), colorData = new Float32Array(INSTANCE_COUNT * 3);
-        
+        const matrixData = new Float32Array(INSTANCE_COUNT*16), colorData = new Float32Array(INSTANCE_COUNT*3);
         const instVao = gl.createVertexArray(); gl.bindVertexArray(instVao);
-        const vBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vBuf); gl.bufferData(gl.ARRAY_BUFFER, astData.verts, gl.STATIC_DRAW);
-        gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-        const nBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, nBuf); gl.bufferData(gl.ARRAY_BUFFER, astData.norms, gl.STATIC_DRAW);
-        gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-        
-        const matBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, matBuf); gl.bufferData(gl.ARRAY_BUFFER, matrixData.byteLength, gl.DYNAMIC_DRAW);
-        for (let i = 0; i < 4; i++) { gl.enableVertexAttribArray(2+i); gl.vertexAttribPointer(2+i, 4, gl.FLOAT, false, 64, i*16); gl.vertexAttribDivisor(2+i, 1); }
-        const colBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, colBuf); gl.bufferData(gl.ARRAY_BUFFER, colorData.byteLength, gl.DYNAMIC_DRAW);
-        gl.enableVertexAttribArray(6); gl.vertexAttribPointer(6, 3, gl.FLOAT, false, 12, 0); gl.vertexAttribDivisor(6, 1);
-        
-        // ==========================================
-        // 6. SCENE & CAMERA SETUP
-        // ==========================================
-        const planet = engine.createEntity();
-        engine.addComponent(planet, 'Transform', Transform(0, 0, 0)); engine.getComponent(planet, 'Transform').scale =[15.0, 15.0, 15.0];
-        engine.addComponent(planet, 'Asteroid', Asteroid(0,[0,1,0], 0.1)); engine.addComponent(planet, 'Material', Material(0.2, 0.4, 0.8, 0.1, 0.9));
-        
-        for (let i = 1; i < INSTANCE_COUNT; i++) {
-            const e = engine.createEntity();
-            let r = 25 + Math.random()*60, a = Math.random()*Math.PI*2, y = (Math.random()-0.5)*8.0, s = 0.2 + Math.random()*1.5, c = 0.4 + Math.random()*0.4;
-            engine.addComponent(e, 'Transform', Transform(Math.cos(a)*r, y, Math.sin(a)*r)); engine.getComponent(e, 'Transform').scale =[s,s,s];
-            engine.addComponent(e, 'Material', Material(c+0.1, c, c-0.1, 0.1, 0.9));
-            engine.addComponent(e, 'Asteroid', Asteroid((1.0/r)*(Math.random()>0.5?1:-1),[Math.random(),Math.random(),Math.random()], Math.random()*2.0));
+        const vBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vBuf); gl.bufferData(gl.ARRAY_BUFFER, astData.verts, gl.STATIC_DRAW); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+        const nBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, nBuf); gl.bufferData(gl.ARRAY_BUFFER, astData.norms, gl.STATIC_DRAW); gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+        const matBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, matBuf); gl.bufferData(gl.ARRAY_BUFFER, matrixData.byteLength, gl.DYNAMIC_DRAW); for (let i=0; i<4; i++) { gl.enableVertexAttribArray(2+i); gl.vertexAttribPointer(2+i, 4, gl.FLOAT, false, 64, i*16); gl.vertexAttribDivisor(2+i, 1); }
+        const colBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, colBuf); gl.bufferData(gl.ARRAY_BUFFER, colorData.byteLength, gl.DYNAMIC_DRAW); gl.enableVertexAttribArray(6); gl.vertexAttribPointer(6, 3, gl.FLOAT, false, 12, 0); gl.vertexAttribDivisor(6, 1);
+
+        const planet = engine.createEntity(); engine.addComponent(planet, 'Transform', Transform(0,0,0)); engine.getComponent(planet, 'Transform').scale=[15,15,15]; engine.addComponent(planet, 'Asteroid', Asteroid(0,[0,1,0],0.1)); engine.addComponent(planet, 'Material', Material(0.2,0.4,0.8,0.1,0.9));
+        for (let i=1; i<INSTANCE_COUNT; i++) {
+            const e=engine.createEntity(); let r=25+Math.random()*60, a=Math.random()*Math.PI*2, y=(Math.random()-0.5)*8., s=0.2+Math.random()*1.5, c=0.4+Math.random()*0.4;
+            engine.addComponent(e, 'Transform', Transform(Math.cos(a)*r, y, Math.sin(a)*r)); engine.getComponent(e, 'Transform').scale=[s,s,s];
+            engine.addComponent(e, 'Material', Material(c+0.1, c, c-0.1, 0.1, 0.9)); engine.addComponent(e, 'Asteroid', Asteroid((1./r)*(Math.random()>0.5?1:-1),[Math.random(),Math.random(),Math.random()], Math.random()*2.));
         }
-        
-        let camRadius = 80, camTheta = 0, camPhi = 1.0, isDragging = false, lastX = 0, lastY = 0;
-        window.addEventListener('mousedown', e => { isDragging = true; lastX = e.clientX; lastY = e.clientY; });
-        window.addEventListener('mouseup', () => isDragging = false);
-        window.addEventListener('mousemove', e => {
-            if(!isDragging) return; camTheta -= (e.clientX - lastX) * 0.005; camPhi += (e.clientY - lastY) * 0.005;
-            camPhi = Math.max(0.1, Math.min(Math.PI - 0.1, camPhi)); lastX = e.clientX; lastY = e.clientY;
-        });
-        window.addEventListener('wheel', e => { camRadius += e.deltaY * 0.05; camRadius = Math.max(20, Math.min(200, camRadius)); });
-        
+
+        let camRadius=80, camTheta=0, camPhi=1.0, isDragging=false, lastX=0, lastY=0;
+        window.addEventListener('mousedown', e=>{isDragging=true; lastX=e.clientX; lastY=e.clientY;}); window.addEventListener('mouseup', ()=>isDragging=false);
+        window.addEventListener('mousemove', e=>{if(!isDragging)return; camTheta-=(e.clientX-lastX)*0.005; camPhi+= (e.clientY-lastY)*0.005; camPhi=Math.max(0.1,Math.min(Math.PI-0.1,camPhi)); lastX=e.clientX; lastY=e.clientY;});
+        window.addEventListener('wheel', e=>{camRadius+=e.deltaY*0.05; camRadius=Math.max(20,Math.min(200,camRadius));});
+
         // ==========================================
-        // 7. RENDER LOOP
+        // 6. RENDER LOOP
         // ==========================================
-        const projMat = Mat4.create(), viewMat = Mat4.create(), viewProjMat = Mat4.create(), invViewProj = Mat4.create();
-        const lightProj = Mat4.create(), lightView = Mat4.create(), lightSpaceMat = Mat4.create();
-        
+        const projMat=Mat4.create(), viewMat=Mat4.create(), viewProjMat=Mat4.create(), invViewProj=Mat4.create();
+        const lightProj=Mat4.create(), lightView=Mat4.create(), lightSpaceMat=Mat4.create();
+
         function renderSystem(time, dt) {
             let entities = engine.query('Transform', 'Asteroid', 'Material'); let idx = 0;
             for (let e of entities) {
-                let t = engine.getComponent(e, 'Transform'), ast = engine.getComponent(e, 'Asteroid'), mat = engine.getComponent(e, 'Material');
-                if (idx !== 0) {
-                    let currentAngle = Math.atan2(t.position[2], t.position[0]) + (ast.orbitSpeed * dt), dist = Math.hypot(t.position[0], t.position[2]);
-                    t.position[0] = Math.cos(currentAngle) * dist; t.position[2] = Math.sin(currentAngle) * dist;
-                }
-                let halfAngle = (time * ast.spinSpeed) * 0.5, s = Math.sin(halfAngle);
-                t.rotation[0]=ast.spinAxis[0]*s; t.rotation[1]=ast.spinAxis[1]*s; t.rotation[2]=ast.spinAxis[2]*s; t.rotation[3]=Math.cos(halfAngle);
+                let t=engine.getComponent(e,'Transform'), ast=engine.getComponent(e,'Asteroid'), mat=engine.getComponent(e,'Material');
+                if (idx !== 0) { let ca=Math.atan2(t.position[2],t.position[0])+(ast.orbitSpeed*dt), d=Math.hypot(t.position[0],t.position[2]); t.position[0]=Math.cos(ca)*d; t.position[2]=Math.sin(ca)*d; }
+                let ha=(time*ast.spinSpeed)*0.5, s=Math.sin(ha); t.rotation[0]=ast.spinAxis[0]*s; t.rotation[1]=ast.spinAxis[1]*s; t.rotation[2]=ast.spinAxis[2]*s; t.rotation[3]=Math.cos(ha);
                 Mat4.fromRotationTranslationScale(t.matrix, t.rotation, t.position, t.scale);
                 matrixData.set(t.matrix, idx * 16); colorData.set(mat.albedo, idx * 3); idx++;
             }
-            gl.bindBuffer(gl.ARRAY_BUFFER, matBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, matrixData);
-            gl.bindBuffer(gl.ARRAY_BUFFER, colBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, colorData);
-        
-            // Day/Night Cycle (Sun completes an orbit every 30 seconds)
-            const sunAngle = time * 0.2;
-            // Y-axis orbit simulates a sunrise -> high noon -> sunset -> night
-            const lightDir =[-Math.cos(sunAngle), -Math.sin(sunAngle), 0.0]; 
-            const lightPos =[lightDir[0]* -100.0, lightDir[1]* -100.0, lightDir[2]* -100.0];
+            gl.bindBuffer(gl.ARRAY_BUFFER, matBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, matrixData); gl.bindBuffer(gl.ARRAY_BUFFER, colBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, colorData);
+
+            const sunAngle=time*0.2, lightDir=[-Math.cos(sunAngle), -Math.sin(sunAngle), 0.0], lightPos=[lightDir[0]*-100., lightDir[1]*-100., lightDir[2]*-100.];
+            Mat4.ortho(lightProj, -90, 90, -90, 90, 1.0, 200.0); Mat4.lookAt(lightView, lightPos, [0,0,0],[0,1,0]); Mat4.multiply(lightSpaceMat, lightProj, lightView);
+
+            // 1. SHADOW
+            gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO); gl.viewport(0,0,SHADOW_RES,SHADOW_RES); gl.enable(gl.DEPTH_TEST); gl.clear(gl.DEPTH_BUFFER_BIT);
+            gl.useProgram(depthProg); gl.uniformMatrix4fv(gl.getUniformLocation(depthProg,"u_lSpace"), false, lightSpaceMat);
+            gl.bindVertexArray(instVao); gl.drawArraysInstanced(gl.TRIANGLES, 0, astData.verts.length/3, INSTANCE_COUNT);
+
+            // 2. SCENE -> HDR FBO
+            gl.bindFramebuffer(gl.FRAMEBUFFER, hdrFBO); gl.viewport(0,0,canvas.width,canvas.height); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+            let cx=Math.sin(camPhi)*Math.cos(camTheta)*camRadius, cy=Math.cos(camPhi)*camRadius, cz=Math.sin(camPhi)*Math.sin(camTheta)*camRadius;
+            Mat4.perspective(projMat, Math.PI/4, canvas.width/canvas.height, 0.1, 300.0); Mat4.lookAt(viewMat, [cx,cy,cz],[0,0,0],[0,1,0]);
+            Mat4.multiply(viewProjMat, projMat, viewMat); Mat4.invert(invViewProj, viewProjMat);
+
+            gl.disable(gl.DEPTH_TEST); gl.useProgram(skyProg);
+            gl.uniformMatrix4fv(gl.getUniformLocation(skyProg,"u_ivp"), false, invViewProj); gl.uniform3fv(gl.getUniformLocation(skyProg,"u_cp"), [cx,cy,cz]); gl.uniform3fv(gl.getUniformLocation(skyProg,"u_ld"), lightDir);
+            gl.bindVertexArray(quadVao); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+            gl.enable(gl.DEPTH_TEST); gl.useProgram(pbrProg);
+            gl.uniformMatrix4fv(gl.getUniformLocation(pbrProg,"u_p"), false, projMat); gl.uniformMatrix4fv(gl.getUniformLocation(pbrProg,"u_v"), false, viewMat);
+            gl.uniformMatrix4fv(gl.getUniformLocation(pbrProg,"u_ls"), false, lightSpaceMat); gl.uniform3fv(gl.getUniformLocation(pbrProg,"u_cp"), [cx,cy,cz]);
+            gl.uniform3fv(gl.getUniformLocation(pbrProg,"u_ld"), lightDir); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, shadowTex); gl.uniform1i(gl.getUniformLocation(pbrProg,"u_sm"), 0);
+            gl.bindVertexArray(instVao); gl.drawArraysInstanced(gl.TRIANGLES, 0, astData.verts.length/3, INSTANCE_COUNT);
+
+            // 3. BLOOM (PING PONG BLUR)
+            gl.disable(gl.DEPTH_TEST); gl.useProgram(blurProg); gl.bindVertexArray(quadVao);
+            let amount = 10, horizontal = true;
+            gl.bindFramebuffer(gl.FRAMEBUFFER, pingFBO); // Copy HDR to Ping
+            gl.viewport(0, 0, canvas.width/2, canvas.height/2);
+            // Initial extraction could happen here, but we'll simple-blur the whole HDR buffer which effectively blooms brights
+            gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, hdrTex);
             
-            Mat4.ortho(lightProj, -90, 90, -90, 90, 1.0, 200.0);
-            Mat4.lookAt(lightView, lightPos, [0, 0, 0],[0, 1, 0]);
-            Mat4.multiply(lightSpaceMat, lightProj, lightView);
-        
-            // PASS 1: SHADOW MAP
-            gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO);
-            gl.viewport(0, 0, SHADOW_RES, SHADOW_RES);
-            gl.enable(gl.DEPTH_TEST); gl.clear(gl.DEPTH_BUFFER_BIT);
-            gl.useProgram(depthProg);
-            gl.uniformMatrix4fv(depthLocs.lightSpaceMat, false, lightSpaceMat);
-            gl.bindVertexArray(instVao);
-            gl.drawArraysInstanced(gl.TRIANGLES, 0, astData.verts.length / 3, INSTANCE_COUNT);
-        
-            // PASS 2: BEAUTY PASS
-            gl.bindFramebuffer(gl.FRAMEBUFFER, targetFBO);
-            gl.viewport(0, 0, canvas.width, canvas.height);
-            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-        
-            let cx = Math.sin(camPhi)*Math.cos(camTheta)*camRadius, cy = Math.cos(camPhi)*camRadius, cz = Math.sin(camPhi)*Math.sin(camTheta)*camRadius;
-            Mat4.perspective(projMat, Math.PI / 4, canvas.width / canvas.height, 0.1, 300.0);
-            Mat4.lookAt(viewMat, [cx, cy, cz],[0, 0, 0],[0, 1, 0]);
-            Mat4.multiply(viewProjMat, projMat, viewMat);
-            Mat4.invert(invViewProj, viewProjMat);
-        
-            // 2A: RENDER SKY (Backdrop)
-            gl.disable(gl.DEPTH_TEST);
-            gl.useProgram(skyProg);
-            gl.uniformMatrix4fv(skyLocs.invVP, false, invViewProj);
-            gl.uniform3fv(skyLocs.camPos, [cx, cy, cz]);
-            gl.uniform3fv(skyLocs.lightDir, lightDir);
-            gl.bindVertexArray(quadVao);
-            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-        
-            // 2B: RENDER ASTEROIDS (Foreground)
-            gl.enable(gl.DEPTH_TEST);
-            gl.useProgram(pbrProg);
-            gl.uniformMatrix4fv(pbrLocs.proj, false, projMat);
-            gl.uniformMatrix4fv(pbrLocs.view, false, viewMat);
-            gl.uniformMatrix4fv(pbrLocs.lightSpaceMat, false, lightSpaceMat);
-            gl.uniform3fv(pbrLocs.camPos, [cx, cy, cz]);
-            gl.uniform3fv(pbrLocs.lightDir, lightDir);
-            gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, shadowTex);
-            gl.uniform1i(pbrLocs.shadowMap, 0);
-            gl.bindVertexArray(instVao);
-            gl.drawArraysInstanced(gl.TRIANGLES, 0, astData.verts.length / 3, INSTANCE_COUNT);
-        
-            // PASS 3: POST PROCESS
-            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-            gl.disable(gl.DEPTH_TEST);
+            for (let i = 0; i < amount; i++) {
+                gl.bindFramebuffer(gl.FRAMEBUFFER, horizontal ? pongFBO : pingFBO);
+                gl.uniform1i(gl.getUniformLocation(blurProg, "u_hor"), horizontal);
+                gl.bindTexture(gl.TEXTURE_2D, horizontal ? pingTex : pongTex); // Read from other
+                if (i==0) gl.bindTexture(gl.TEXTURE_2D, hdrTex); // First iteration reads scene
+                gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+                horizontal = !horizontal;
+            }
+
+            // 4. COMPOSITE
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0,0,canvas.width,canvas.height);
             gl.useProgram(postProg);
-            gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, targetTex);
-            gl.bindVertexArray(quadVao);
-            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, hdrTex); gl.uniform1i(gl.getUniformLocation(postProg, "u_scene"), 0);
+            gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, horizontal ? pingTex : pongTex); gl.uniform1i(gl.getUniformLocation(postProg, "u_bloom"), 1);
+            gl.bindVertexArray(quadVao); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
         }
-        
-        // ==========================================
-        // 8. BOOTSTRAP
-        // ==========================================
-        let lastTime = performance.now(), frames = 0, lastFpsUpdate = lastTime;
+
+        let lastTime=performance.now(), frames=0, lastFpsUpdate=lastTime;
         function loop(now) {
-            let dt = (now - lastTime) / 1000.0; if(dt > 0.1) dt = 0.016;
-            frames++; if (now - lastFpsUpdate > 1000) { document.title = `JS Engine | FPS: ${frames} | Objects: 15k | Sky Atmosphere`; frames = 0; lastFpsUpdate = now; }
-            renderSystem(now * 0.001, dt); lastTime = now; requestAnimationFrame(loop);
+            let dt=(now-lastTime)/1000.; if(dt>0.1)dt=0.016; frames++; if(now-lastFpsUpdate>1000){document.title=`JS Engine | FPS: ${frames} | Bloom Enabled`; frames=0; lastFpsUpdate=now;}
+            renderSystem(now*0.001, dt); lastTime=now; requestAnimationFrame(loop);
         }
-        window.addEventListener('resize', () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; setupFBO(canvas.width, canvas.height); });
-        window.dispatchEvent(new Event('resize'));
-        requestAnimationFrame(loop);
+        window.addEventListener('resize', ()=>{canvas.width=window.innerWidth; canvas.height=window.innerHeight; setupFBOs(canvas.width, canvas.height);});
+        window.dispatchEvent(new Event('resize')); requestAnimationFrame(loop);
     </script>
 </body>
 </html>
