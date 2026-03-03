@@ -23,22 +23,18 @@
 
         let frameBuffer = ctx.createImageData(width, height);
         let buf32 = new Uint32Array(frameBuffer.data.buffer);
-
-        // NEW: The Depth Buffer! Stores the depth of every single pixel.
         let zBuffer = new Float32Array(width * height);
 
-        // --- LOW LEVEL FUNCTIONS ---
         function clearBuffers(color = 0xFF000000) {
-            buf32.fill(color);          // Clear visual screen to black
-            zBuffer.fill(Infinity);     // Clear depth buffer to infinity
+            buf32.fill(color);
+            zBuffer.fill(Infinity);
         }
 
         function rgb(r, g, b) {
             return (255 << 24) | ((b & 255) << 16) | ((g & 255) << 8) | (r & 255);
         }
 
-        // --- VECTOR MATH ENGINE (NEW) ---
-        // These functions allow us to calculate 3D angles and lighting
+        // --- VECTOR MATH ENGINE ---
         const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
         const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
         const cross = (a, b) => [
@@ -59,31 +55,24 @@
             let maxY = Math.min(height - 1, Math.ceil(Math.max(y0, y1, y2)));
 
             const edge = (ax, ay, bx, by, cx, cy) => (cx - ax) * (by - ay) - (cy - ay) * (bx - ax);
-
-            // Precalculate the total area of the triangle
             let area = edge(x0, y0, x1, y1, x2, y2);
-            if (area === 0) return; // Prevent division by zero
+
+            if (area === 0) return;
 
             for (let y = minY; y <= maxY; y++) {
                 for (let x = minX; x <= maxX; x++) {
-
                     let w0 = edge(x1, y1, x2, y2, x, y);
                     let w1 = edge(x2, y2, x0, y0, x, y);
                     let w2 = edge(x0, y0, x1, y1, x, y);
 
-                    // If pixel is inside the triangle
                     if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)) {
-
-                        // Barycentric Weights (How close is the pixel to each vertex?)
                         let alpha = w0 / area;
                         let beta = w1 / area;
                         let gamma = w2 / area;
 
-                        // Interpolate the exact Z-depth for this single pixel
                         let pixelZ = z0 * alpha + z1 * beta + z2 * gamma;
                         let index = y * width + x;
 
-                        // THE Z-BUFFER TEST: Only draw if closer than previous pixel
                         if (pixelZ < zBuffer[index]) {
                             zBuffer[index] = pixelZ;
                             buf32[index] = color;
@@ -93,22 +82,78 @@
             }
         }
 
-        // --- 3D GEOMETRY ---
-        const vertices =[
-            [-1, -1, -1],[ 1, -1, -1], [ 1,  1, -1], [-1,  1, -1], // Front
-            [-1, -1,  1],[ 1, -1,  1],[ 1,  1,  1], [-1,  1,  1]  // Back
-        ];
+        // --- .OBJ PARSER ---
 
-        // Colors are now separated [R, G, B] so we can multiply them by Light Intensity
-        const faces = [
-            /* Front */ [0, 1, 2,[200, 50, 50]], [0, 2, 3,[200, 50, 50]],
-            /* Back  */ [5, 4, 7,[50, 200, 50]], [5, 7, 6,[50, 200, 50]],
-            /* Left  */ [4, 0, 3,[50, 50, 200]], [4, 3, 7,[50, 50, 200]],
-            /* Right */ [1, 5, 6,[200, 200, 50]], [1, 6, 2,[200, 200, 50]],
-            /* Top   */[3, 2, 6, [200, 50, 200]],[3, 6, 7, [200, 50, 200]],
-            /* Bottom*/[4, 5, 1, [50, 200, 200]],[4, 1, 0, [50, 200, 200]]
-        ];
+        // This is the raw text data of a 3D Model (An Icosahedron / Gemstone)
+        // You can export ANY model from Blender as an .obj and paste it here!
+        const objData = `
+            v -0.525731 0 0.850651
+            v 0.525731 0 0.850651
+            v -0.525731 0 -0.850651
+            v 0.525731 0 -0.850651
+            v 0 0.850651 0.525731
+            v 0 0.850651 -0.525731
+            v 0 -0.850651 0.525731
+            v 0 -0.850651 -0.525731
+            v 0.850651 0.525731 0
+            v -0.850651 0.525731 0
+            v 0.850651 -0.525731 0
+            v -0.850651 -0.525731 0
+            f 1 5 2
+            f 2 5 9
+            f 9 5 6
+            f 6 5 10
+            f 10 5 1
+            f 2 9 11
+            f 9 6 4
+            f 6 10 3
+            f 10 1 12
+            f 1 2 7
+            f 11 7 2
+            f 4 11 9
+            f 3 4 6
+            f 12 3 10
+            f 7 12 1
+            f 8 7 11
+            f 8 11 4
+            f 8 4 3
+            f 8 3 12
+            f 8 12 7
+        `;
 
+        let vertices = [];
+        let faces =[];
+
+        function parseOBJ(data) {
+            const lines = data.split('\n');
+            const baseColor =[255, 215, 0]; // Golden Yellow color for the gemstone
+
+            for (let i = 0; i < lines.length; i++) {
+                const parts = lines[i].trim().split(/\s+/);
+                if (parts[0] === 'v') {
+                    // Parse vertex coordinates
+                    vertices.push([parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3])]);
+                } else if (parts[0] === 'f') {
+                    // Parse faces. OBJ indices start at 1, so we subtract 1.
+                    // We also extract just the vertex index (ignoring UV/Normals if present)
+                    const v1 = parseInt(parts[1].split('/')[0]) - 1;
+                    const v2 = parseInt(parts[2].split('/')[0]) - 1;
+                    const v3 = parseInt(parts[3].split('/')[0]) - 1;
+                    faces.push([v1, v2, v3, baseColor]);
+
+                    // If it's a quad (4 vertices), triangulate it by making a second triangle
+                    if (parts.length > 4) {
+                        const v4 = parseInt(parts[4].split('/')[0]) - 1;
+                        faces.push([v1, v3, v4, baseColor]);
+                    }
+                }
+            }
+        }
+
+        // Run the parser!
+        parseOBJ(objData);
+
+        // --- 3D MATH ENGINE ---
         function rotate3D(x, y, z, pitch, yaw, roll) {
             let cosX = Math.cos(pitch), sinX = Math.sin(pitch);
             let y1 = y * cosX - z * sinX, z1 = y * sinX + z * cosX;
@@ -119,13 +164,11 @@
             let cosZ = Math.cos(roll), sinZ = Math.sin(roll);
             let x3 = x2 * cosZ - y1 * sinZ, y3 = x2 * sinZ + y1 * cosZ;
 
-            return[x3, y3, z2];
+            return [x3, y3, z2];
         }
 
         // --- THE RENDER LOOP ---
         let time = 0;
-
-        // Light coming from the top-left, pointing into the screen
         let lightDir = norm([-1, -1, -1]); 
 
         function draw() {
@@ -135,18 +178,22 @@
             const cy = height / 2;
             const fov = Math.min(width, height) * 0.8; 
 
-            time += 0.015;
+            time += 0.01;
 
             // 1. Transform vertices
             const transformedVertices =[];
+            const scale = 1.5; // Make the model bigger
+
             for (let i = 0; i < vertices.length; i++) {
                 let [x, y, z] = vertices[i];
-                let [rx, ry, rz] = rotate3D(x, y, z, time, time * 0.8, time * 0.5);
-                rz += 4; 
+
+                // Apply scale and rotation
+                let [rx, ry, rz] = rotate3D(x * scale, y * scale, z * scale, time * 0.5, time * 1.2, time * 0.3);
+                rz += 5; // Move away from camera
                 transformedVertices.push([rx, ry, rz]);
             }
 
-            // 2. Process faces (Sorting is completely gone!)
+            // 2. Process faces
             for (let i = 0; i < faces.length; i++) {
                 const[v1, v2, v3, baseColor] = faces[i];
 
@@ -157,23 +204,16 @@
                 if (p1[2] < 0.1 || p2[2] < 0.1 || p3[2] < 0.1) continue;
 
                 // --- BACKFACE CULLING ---
-                // Calculate the Normal Vector (the direction the face is pointing)
                 let vecA = sub(p2, p1);
                 let vecB = sub(p3, p1);
                 let normal = norm(cross(vecB, vecA));
 
-                // Create a ray from the camera (0,0,0) to the face
                 let cameraRay = p1; 
-
-                // If the normal points in the same direction as the camera ray, it's facing away. Discard it!
                 if (dot(normal, cameraRay) > 0) continue; 
 
-                // --- LIGHTING (SHADING) ---
-                // Compare the normal vector to the reversed light vector
+                // --- LIGHTING ---
                 let intensity = dot(normal, [-lightDir[0], -lightDir[1], -lightDir[2]]);
-
-                // Clamp intensity so shadows don't drop below 20% brightness (Ambient Light)
-                intensity = Math.max(0.2, Math.min(1.0, intensity));
+                intensity = Math.max(0.15, Math.min(1.0, intensity)); // 15% minimum ambient light
 
                 let shadedColor = rgb(
                     baseColor[0] * intensity,
@@ -186,7 +226,6 @@
                 let x1 = (p2[0] / p2[2]) * fov + cx; let y1 = (p2[1] / p2[2]) * fov + cy;
                 let x2 = (p3[0] / p3[2]) * fov + cx; let y2 = (p3[1] / p3[2]) * fov + cy;
 
-                // Draw! (Passing the Z-coordinates so the Z-Buffer works)
                 fillTriangle(x0, y0, p1[2], x1, y1, p2[2], x2, y2, p3[2], shadedColor);
             }
 
