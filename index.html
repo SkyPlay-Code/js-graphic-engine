@@ -15,169 +15,195 @@
         // --- INITIALIZATION ---
         const canvas = document.getElementById('screen');
         const ctx = canvas.getContext('2d');
-    
+
         let width = window.innerWidth;
         let height = window.innerHeight;
         canvas.width = width;
         canvas.height = height;
-    
+
         let frameBuffer = ctx.createImageData(width, height);
-        let data = frameBuffer.data;
-        let buf32 = new Uint32Array(data.buffer);
-    
+        let buf32 = new Uint32Array(frameBuffer.data.buffer);
+
+        // NEW: The Depth Buffer! Stores the depth of every single pixel.
+        let zBuffer = new Float32Array(width * height);
+
         // --- LOW LEVEL FUNCTIONS ---
-        function putPixel(x, y, color) {
-            x = x | 0; y = y | 0;
-            if (x < 0 || x >= width || y < 0 || y >= height) return;
-            buf32[y * width + x] = color;
+        function clearBuffers(color = 0xFF000000) {
+            buf32.fill(color);          // Clear visual screen to black
+            zBuffer.fill(Infinity);     // Clear depth buffer to infinity
         }
-    
-        function clearBuffer(color = 0xFF000000) {
-            buf32.fill(color);
-        }
-    
+
         function rgb(r, g, b) {
-            return (255 << 24) | (b << 16) | (g << 8) | r;
+            return (255 << 24) | ((b & 255) << 16) | ((g & 255) << 8) | (r & 255);
         }
-    
-        // --- TRIANGLE RASTERIZATION ---
-        function fillTriangle(x0, y0, x1, y1, x2, y2, color) {
-            // Find the bounding box of the triangle
-            let minX = Math.floor(Math.min(x0, x1, x2));
-            let maxX = Math.ceil(Math.max(x0, x1, x2));
-            let minY = Math.floor(Math.min(y0, y1, y2));
-            let maxY = Math.ceil(Math.max(y0, y1, y2));
-        
-            // Clip to screen boundaries
-            minX = Math.max(0, minX);
-            maxX = Math.min(width - 1, maxX);
-            minY = Math.max(0, minY);
-            maxY = Math.min(height - 1, maxY);
-        
-            // Edge function math
-            const edge = (ax, ay, bx, by, cx, cy) => 
-                (cx - ax) * (by - ay) - (cy - ay) * (bx - ax);
-        
+
+        // --- VECTOR MATH ENGINE (NEW) ---
+        // These functions allow us to calculate 3D angles and lighting
+        const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        const cross = (a, b) => [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0]
+        ];
+        const norm = (a) => {
+            let len = Math.sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]);
+            return len ? [a[0]/len, a[1]/len, a[2]/len] : [0, 0, 0];
+        };
+
+        // --- TRIANGLE RASTERIZATION & Z-BUFFERING ---
+        function fillTriangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, color) {
+            let minX = Math.max(0, Math.floor(Math.min(x0, x1, x2)));
+            let maxX = Math.min(width - 1, Math.ceil(Math.max(x0, x1, x2)));
+            let minY = Math.max(0, Math.floor(Math.min(y0, y1, y2)));
+            let maxY = Math.min(height - 1, Math.ceil(Math.max(y0, y1, y2)));
+
+            const edge = (ax, ay, bx, by, cx, cy) => (cx - ax) * (by - ay) - (cy - ay) * (bx - ax);
+
+            // Precalculate the total area of the triangle
+            let area = edge(x0, y0, x1, y1, x2, y2);
+            if (area === 0) return; // Prevent division by zero
+
             for (let y = minY; y <= maxY; y++) {
                 for (let x = minX; x <= maxX; x++) {
-                    
+
                     let w0 = edge(x1, y1, x2, y2, x, y);
                     let w1 = edge(x2, y2, x0, y0, x, y);
                     let w2 = edge(x0, y0, x1, y1, x, y);
-                
-                    let isInside = (w0 >= 0 && w1 >= 0 && w2 >= 0) || 
-                                   (w0 <= 0 && w1 <= 0 && w2 <= 0);
-                    
-                    if (isInside) {
-                        putPixel(x, y, color);
+
+                    // If pixel is inside the triangle
+                    if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)) {
+
+                        // Barycentric Weights (How close is the pixel to each vertex?)
+                        let alpha = w0 / area;
+                        let beta = w1 / area;
+                        let gamma = w2 / area;
+
+                        // Interpolate the exact Z-depth for this single pixel
+                        let pixelZ = z0 * alpha + z1 * beta + z2 * gamma;
+                        let index = y * width + x;
+
+                        // THE Z-BUFFER TEST: Only draw if closer than previous pixel
+                        if (pixelZ < zBuffer[index]) {
+                            zBuffer[index] = pixelZ;
+                            buf32[index] = color;
+                        }
                     }
                 }
             }
         }
-    
+
         // --- 3D GEOMETRY ---
         const vertices =[
-            /* Front Face (0 to 3) */
-            [-1, -1, -1],[ 1, -1, -1], [ 1,  1, -1], [-1,  1, -1], 
-            /* Back Face (4 to 7) */
-            [-1, -1,  1],[ 1, -1,  1], [ 1,  1,  1],[-1,  1,  1]  
+            [-1, -1, -1],[ 1, -1, -1], [ 1,  1, -1], [-1,  1, -1], // Front
+            [-1, -1,  1],[ 1, -1,  1],[ 1,  1,  1], [-1,  1,  1]  // Back
         ];
-    
+
+        // Colors are now separated [R, G, B] so we can multiply them by Light Intensity
         const faces = [
-            /* Front (Red) */[0, 1, 2, rgb(200, 50, 50)],[0, 2, 3, rgb(200, 50, 50)],
-            /* Back (Green) */[5, 4, 7, rgb(50, 200, 50)],[5, 7, 6, rgb(50, 200, 50)],
-            /* Left (Blue) */[4, 0, 3, rgb(50, 50, 200)],[4, 3, 7, rgb(50, 50, 200)],
-            /* Right (Yellow) */[1, 5, 6, rgb(200, 200, 50)],[1, 6, 2, rgb(200, 200, 50)],
-            /* Top (Magenta) */[3, 2, 6, rgb(200, 50, 200)],[3, 6, 7, rgb(200, 50, 200)],
-            /* Bottom (Cyan) */[4, 5, 1, rgb(50, 200, 200)],[4, 1, 0, rgb(50, 200, 200)]
+            /* Front */ [0, 1, 2,[200, 50, 50]], [0, 2, 3,[200, 50, 50]],
+            /* Back  */ [5, 4, 7,[50, 200, 50]], [5, 7, 6,[50, 200, 50]],
+            /* Left  */ [4, 0, 3,[50, 50, 200]], [4, 3, 7,[50, 50, 200]],
+            /* Right */ [1, 5, 6,[200, 200, 50]], [1, 6, 2,[200, 200, 50]],
+            /* Top   */[3, 2, 6, [200, 50, 200]],[3, 6, 7, [200, 50, 200]],
+            /* Bottom*/[4, 5, 1, [50, 200, 200]],[4, 1, 0, [50, 200, 200]]
         ];
-    
-        // --- 3D MATH ENGINE ---
+
         function rotate3D(x, y, z, pitch, yaw, roll) {
             let cosX = Math.cos(pitch), sinX = Math.sin(pitch);
             let y1 = y * cosX - z * sinX, z1 = y * sinX + z * cosX;
-        
+
             let cosY = Math.cos(yaw), sinY = Math.sin(yaw);
             let x2 = x * cosY + z1 * sinY, z2 = -x * sinY + z1 * cosY;
-        
+
             let cosZ = Math.cos(roll), sinZ = Math.sin(roll);
             let x3 = x2 * cosZ - y1 * sinZ, y3 = x2 * sinZ + y1 * cosZ;
-        
+
             return[x3, y3, z2];
         }
-    
+
         // --- THE RENDER LOOP ---
         let time = 0;
-    
+
+        // Light coming from the top-left, pointing into the screen
+        let lightDir = norm([-1, -1, -1]); 
+
         function draw() {
-            clearBuffer(0xFF000000);
-        
+            clearBuffers(0xFF000000);
+
             const cx = width / 2;
             const cy = height / 2;
             const fov = Math.min(width, height) * 0.8; 
-            
+
             time += 0.015;
-        
+
             // 1. Transform vertices
             const transformedVertices =[];
             for (let i = 0; i < vertices.length; i++) {
                 let [x, y, z] = vertices[i];
                 let [rx, ry, rz] = rotate3D(x, y, z, time, time * 0.8, time * 0.5);
-                rz += 4; // Move away from camera
+                rz += 4; 
                 transformedVertices.push([rx, ry, rz]);
             }
-        
-            // 2. Prepare triangles
-            const trianglesToRender =[];
-        
+
+            // 2. Process faces (Sorting is completely gone!)
             for (let i = 0; i < faces.length; i++) {
-                const [v1, v2, v3, color] = faces[i];
-                
-                const p1 = transformedVertices[v1];
-                const p2 = transformedVertices[v2];
-                const p3 = transformedVertices[v3];
-            
+                const[v1, v2, v3, baseColor] = faces[i];
+
+                let p1 = transformedVertices[v1];
+                let p2 = transformedVertices[v2];
+                let p3 = transformedVertices[v3];
+
                 if (p1[2] < 0.1 || p2[2] < 0.1 || p3[2] < 0.1) continue;
-            
-                let x0 = (p1[0] / p1[2]) * fov + cx;
-                let y0 = (p1[1] / p1[2]) * fov + cy;
-                
-                let x1 = (p2[0] / p2[2]) * fov + cx;
-                let y1 = (p2[1] / p2[2]) * fov + cy;
-                
-                let x2 = (p3[0] / p3[2]) * fov + cx;
-                let y2 = (p3[1] / p3[2]) * fov + cy;
-            
-                let avgZ = (p1[2] + p2[2] + p3[2]) / 3;
-            
-                trianglesToRender.push({
-                    x0, y0, x1, y1, x2, y2, z: avgZ, color
-                });
+
+                // --- BACKFACE CULLING ---
+                // Calculate the Normal Vector (the direction the face is pointing)
+                let vecA = sub(p2, p1);
+                let vecB = sub(p3, p1);
+                let normal = norm(cross(vecB, vecA));
+
+                // Create a ray from the camera (0,0,0) to the face
+                let cameraRay = p1; 
+
+                // If the normal points in the same direction as the camera ray, it's facing away. Discard it!
+                if (dot(normal, cameraRay) > 0) continue; 
+
+                // --- LIGHTING (SHADING) ---
+                // Compare the normal vector to the reversed light vector
+                let intensity = dot(normal, [-lightDir[0], -lightDir[1], -lightDir[2]]);
+
+                // Clamp intensity so shadows don't drop below 20% brightness (Ambient Light)
+                intensity = Math.max(0.2, Math.min(1.0, intensity));
+
+                let shadedColor = rgb(
+                    baseColor[0] * intensity,
+                    baseColor[1] * intensity,
+                    baseColor[2] * intensity
+                );
+
+                // --- PERSPECTIVE PROJECTION ---
+                let x0 = (p1[0] / p1[2]) * fov + cx; let y0 = (p1[1] / p1[2]) * fov + cy;
+                let x1 = (p2[0] / p2[2]) * fov + cx; let y1 = (p2[1] / p2[2]) * fov + cy;
+                let x2 = (p3[0] / p3[2]) * fov + cx; let y2 = (p3[1] / p3[2]) * fov + cy;
+
+                // Draw! (Passing the Z-coordinates so the Z-Buffer works)
+                fillTriangle(x0, y0, p1[2], x1, y1, p2[2], x2, y2, p3[2], shadedColor);
             }
-        
-            // 3. Painter's Algorithm: Sort by Z (Depth)
-            trianglesToRender.sort((a, b) => b.z - a.z);
-        
-            // 4. Draw
-            for (let i = 0; i < trianglesToRender.length; i++) {
-                const t = trianglesToRender[i];
-                fillTriangle(t.x0, t.y0, t.x1, t.y1, t.x2, t.y2, t.color);
-            }
-        
+
             ctx.putImageData(frameBuffer, 0, 0);
             requestAnimationFrame(draw);
         }
-    
+
         draw();
-    
+
         window.addEventListener('resize', () => {
             width = window.innerWidth;
             height = window.innerHeight;
             canvas.width = width;
             canvas.height = height;
             frameBuffer = ctx.createImageData(width, height);
-            data = frameBuffer.data;
-            buf32 = new Uint32Array(data.buffer);
+            buf32 = new Uint32Array(frameBuffer.data.buffer);
+            zBuffer = new Float32Array(width * height);
         });
     </script>
 </body>
