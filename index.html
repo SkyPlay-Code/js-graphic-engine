@@ -47,7 +47,7 @@
             return len ? [a[0]/len, a[1]/len, a[2]/len] : [0, 0, 0];
         };
 
-        // --- TRIANGLE RASTERIZATION & Z-BUFFERING ---
+        // --- RASTERIZATION ---
         function fillTriangle(x0, y0, z0, x1, y1, z1, x2, y2, z2, color) {
             let minX = Math.max(0, Math.floor(Math.min(x0, x1, x2)));
             let maxX = Math.min(width - 1, Math.ceil(Math.max(x0, x1, x2)));
@@ -83,9 +83,6 @@
         }
 
         // --- .OBJ PARSER ---
-
-        // This is the raw text data of a 3D Model (An Icosahedron / Gemstone)
-        // You can export ANY model from Blender as an .obj and paste it here!
         const objData = `
             v -0.525731 0 0.850651
             v 0.525731 0 0.850651
@@ -124,116 +121,186 @@
         let vertices = [];
         let faces =[];
 
-        function parseOBJ(data) {
-            const lines = data.split('\n');
-            const baseColor =[255, 215, 0]; // Golden Yellow color for the gemstone
-
-            for (let i = 0; i < lines.length; i++) {
-                const parts = lines[i].trim().split(/\s+/);
-                if (parts[0] === 'v') {
-                    // Parse vertex coordinates
-                    vertices.push([parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3])]);
-                } else if (parts[0] === 'f') {
-                    // Parse faces. OBJ indices start at 1, so we subtract 1.
-                    // We also extract just the vertex index (ignoring UV/Normals if present)
-                    const v1 = parseInt(parts[1].split('/')[0]) - 1;
-                    const v2 = parseInt(parts[2].split('/')[0]) - 1;
-                    const v3 = parseInt(parts[3].split('/')[0]) - 1;
-                    faces.push([v1, v2, v3, baseColor]);
-
-                    // If it's a quad (4 vertices), triangulate it by making a second triangle
-                    if (parts.length > 4) {
-                        const v4 = parseInt(parts[4].split('/')[0]) - 1;
-                        faces.push([v1, v3, v4, baseColor]);
-                    }
+        const lines = objData.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+            const parts = lines[i].trim().split(/\s+/);
+            if (parts[0] === 'v') {
+                vertices.push([parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3])]);
+            } else if (parts[0] === 'f') {
+                const v1 = parseInt(parts[1].split('/')[0]) - 1;
+                const v2 = parseInt(parts[2].split('/')[0]) - 1;
+                const v3 = parseInt(parts[3].split('/')[0]) - 1;
+                faces.push([v1, v2, v3]);
+                if (parts.length > 4) {
+                    const v4 = parseInt(parts[4].split('/')[0]) - 1;
+                    faces.push([v1, v3, v4]);
                 }
             }
         }
 
-        // Run the parser!
-        parseOBJ(objData);
+        // --- CAMERA & INPUT (NEW) ---
+        const keys = {};
+        window.addEventListener('keydown', e => keys[e.code] = true);
+        window.addEventListener('keyup', e => keys[e.code] = false);
+
+        // The Virtual Camera!
+        let camera = { x: 0, y: 0, z: -8, yaw: 0, pitch: 0 };
+
+        function updateCamera(dt) {
+            const moveSpeed = 10 * dt;
+            const turnSpeed = 2 * dt;
+
+            // Trigonometry to move Forward/Backward based on where we are looking
+            if (keys['KeyW']) { camera.x += Math.sin(camera.yaw) * moveSpeed; camera.z += Math.cos(camera.yaw) * moveSpeed; }
+            if (keys['KeyS']) { camera.x -= Math.sin(camera.yaw) * moveSpeed; camera.z -= Math.cos(camera.yaw) * moveSpeed; }
+
+            // Strafing Left/Right
+            if (keys['KeyA']) { camera.x -= Math.cos(camera.yaw) * moveSpeed; camera.z += Math.sin(camera.yaw) * moveSpeed; }
+            if (keys['KeyD']) { camera.x += Math.cos(camera.yaw) * moveSpeed; camera.z -= Math.sin(camera.yaw) * moveSpeed; }
+
+            // Vertical Movement
+            if (keys['Space']) camera.y -= moveSpeed;
+            if (keys['ShiftLeft']) camera.y += moveSpeed;
+
+            // Looking around
+            if (keys['ArrowLeft']) camera.yaw -= turnSpeed;
+            if (keys['ArrowRight']) camera.yaw += turnSpeed;
+            if (keys['ArrowUp']) camera.pitch -= turnSpeed;
+            if (keys['ArrowDown']) camera.pitch += turnSpeed;
+        }
 
         // --- 3D MATH ENGINE ---
+        // Rotates objects locally
         function rotate3D(x, y, z, pitch, yaw, roll) {
             let cosX = Math.cos(pitch), sinX = Math.sin(pitch);
             let y1 = y * cosX - z * sinX, z1 = y * sinX + z * cosX;
-
             let cosY = Math.cos(yaw), sinY = Math.sin(yaw);
             let x2 = x * cosY + z1 * sinY, z2 = -x * sinY + z1 * cosY;
-
             let cosZ = Math.cos(roll), sinZ = Math.sin(roll);
             let x3 = x2 * cosZ - y1 * sinZ, y3 = x2 * sinZ + y1 * cosZ;
-
             return [x3, y3, z2];
         }
 
-        // --- THE RENDER LOOP ---
-        let time = 0;
-        let lightDir = norm([-1, -1, -1]); 
+        // Rotates the world around the camera
+        function rotateByCamera(x, y, z) {
+            let cosY = Math.cos(-camera.yaw), sinY = Math.sin(-camera.yaw);
+            let rx = x * cosY + z * sinY;
+            let rz = -x * sinY + z * cosY;
 
-        function draw() {
+            let cosX = Math.cos(-camera.pitch), sinX = Math.sin(-camera.pitch);
+            let ry = y * cosX - rz * sinX;
+            let fz = y * sinX + rz * cosX;
+            return [rx, ry, fz];
+        }
+
+        // Applies both Camera Translation and Rotation to a point
+        function applyCamera(x, y, z) {
+            return rotateByCamera(x - camera.x, y - camera.y, z - camera.z);
+        }
+
+        // --- SCENE SETUP (NEW) ---
+        // Let's spawn 5 gemstones in a 3D environment
+        const scene =[
+            { x: 0, y: 0, z: 0, scale: 2.0, color:[255, 215, 0] },     // Center (Gold)
+            { x: -8, y: -3, z: 8, scale: 1.5, color: [255, 50, 50] },   // Bottom Left (Red)
+            { x: 8, y: 3, z: 8, scale: 1.5, color: [50, 50, 255] },     // Top Right (Blue)
+            { x: -8, y: 3, z: -8, scale: 1.5, color: [50, 255, 50] },   // Top Behind (Green)
+            { x: 8, y: -3, z: -8, scale: 1.5, color:[255, 50, 255] }   // Bottom Behind (Magenta)
+        ];
+
+        const lightDirWorld = norm([-1, -1, -1]); // A fixed "Sun" in the world
+
+        // --- THE RENDER LOOP ---
+        let lastTime = 0;
+        let time = 0;
+
+        function draw(timestamp) {
+            // Calculate Delta Time to ensure movement is smooth regardless of FPS
+            let dt = (timestamp - lastTime) / 1000;
+            if (lastTime === 0 || dt > 0.1) dt = 0.016; 
+            lastTime = timestamp;
+            time += dt;
+
+            updateCamera(dt);
             clearBuffers(0xFF000000);
 
             const cx = width / 2;
             const cy = height / 2;
             const fov = Math.min(width, height) * 0.8; 
 
-            time += 0.01;
+            // Convert the sun's light direction into the Camera's View Space
+            let viewLightDir = norm(rotateByCamera(lightDirWorld[0], lightDirWorld[1], lightDirWorld[2]));
 
-            // 1. Transform vertices
-            const transformedVertices =[];
-            const scale = 1.5; // Make the model bigger
+            // Render every object in the scene
+            for (let obj of scene) {
+                const transformedVertices =[];
 
-            for (let i = 0; i < vertices.length; i++) {
-                let [x, y, z] = vertices[i];
+                // 1. Transform Vertices (Local -> World -> Camera View)
+                for (let i = 0; i < vertices.length; i++) {
+                    let [x, y, z] = vertices[i];
 
-                // Apply scale and rotation
-                let [rx, ry, rz] = rotate3D(x * scale, y * scale, z * scale, time * 0.5, time * 1.2, time * 0.3);
-                rz += 5; // Move away from camera
-                transformedVertices.push([rx, ry, rz]);
+                    // Spin object slowly
+                    let[lx, ly, lz] = rotate3D(x * obj.scale, y * obj.scale, z * obj.scale, time * 0.5, time * 1.2, time * 0.3);
+
+                    // Move object to its place in the world
+                    let wx = lx + obj.x; let wy = ly + obj.y; let wz = lz + obj.z;
+
+                    // Shift world relative to the Camera
+                    let [vx, vy, vz] = applyCamera(wx, wy, wz);
+                    transformedVertices.push([vx, vy, vz]);
+                }
+
+                // 2. Process Faces
+                for (let i = 0; i < faces.length; i++) {
+                    const [v1, v2, v3] = faces[i];
+                    let p1 = transformedVertices[v1];
+                    let p2 = transformedVertices[v2];
+                    let p3 = transformedVertices[v3];
+
+                    // Near Plane Clipping (Don't draw things behind us)
+                    if (p1[2] < 0.1 || p2[2] < 0.1 || p3[2] < 0.1) continue;
+
+                    // Backface Culling (Calculated in View Space)
+                    let vecA = sub(p2, p1); let vecB = sub(p3, p1);
+                    let normal = norm(cross(vecB, vecA));
+                    if (dot(normal, p1) > 0) continue; 
+
+                    // Lighting
+                    let intensity = dot(normal,[-viewLightDir[0], -viewLightDir[1], -viewLightDir[2]]);
+                    intensity = Math.max(0.15, Math.min(1.0, intensity));
+
+                    let shadedColor = rgb(
+                        obj.color[0] * intensity,
+                        obj.color[1] * intensity,
+                        obj.color[2] * intensity
+                    );
+
+                    // Perspective Projection
+                    let x0 = (p1[0] / p1[2]) * fov + cx; let y0 = (p1[1] / p1[2]) * fov + cy;
+                    let x1 = (p2[0] / p2[2]) * fov + cx; let y1 = (p2[1] / p2[2]) * fov + cy;
+                    let x2 = (p3[0] / p3[2]) * fov + cx; let y2 = (p3[1] / p3[2]) * fov + cy;
+
+                    fillTriangle(x0, y0, p1[2], x1, y1, p2[2], x2, y2, p3[2], shadedColor);
+                }
             }
 
-            // 2. Process faces
-            for (let i = 0; i < faces.length; i++) {
-                const[v1, v2, v3, baseColor] = faces[i];
-
-                let p1 = transformedVertices[v1];
-                let p2 = transformedVertices[v2];
-                let p3 = transformedVertices[v3];
-
-                if (p1[2] < 0.1 || p2[2] < 0.1 || p3[2] < 0.1) continue;
-
-                // --- BACKFACE CULLING ---
-                let vecA = sub(p2, p1);
-                let vecB = sub(p3, p1);
-                let normal = norm(cross(vecB, vecA));
-
-                let cameraRay = p1; 
-                if (dot(normal, cameraRay) > 0) continue; 
-
-                // --- LIGHTING ---
-                let intensity = dot(normal, [-lightDir[0], -lightDir[1], -lightDir[2]]);
-                intensity = Math.max(0.15, Math.min(1.0, intensity)); // 15% minimum ambient light
-
-                let shadedColor = rgb(
-                    baseColor[0] * intensity,
-                    baseColor[1] * intensity,
-                    baseColor[2] * intensity
-                );
-
-                // --- PERSPECTIVE PROJECTION ---
-                let x0 = (p1[0] / p1[2]) * fov + cx; let y0 = (p1[1] / p1[2]) * fov + cy;
-                let x1 = (p2[0] / p2[2]) * fov + cx; let y1 = (p2[1] / p2[2]) * fov + cy;
-                let x2 = (p3[0] / p3[2]) * fov + cx; let y2 = (p3[1] / p3[2]) * fov + cy;
-
-                fillTriangle(x0, y0, p1[2], x1, y1, p2[2], x2, y2, p3[2], shadedColor);
-            }
-
+            // Draw the pixel buffer to the screen
             ctx.putImageData(frameBuffer, 0, 0);
+
+            // --- UI TEXT OVERLAY ---
+            ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
+            ctx.fillRect(10, 10, 360, 110);
+            ctx.fillStyle = "white";
+            ctx.font = "16px monospace";
+            ctx.fillText("ENGINE CONTROLS:", 20, 35);
+            ctx.fillText("W/A/S/D     : Move around", 20, 60);
+            ctx.fillText("SPACE/SHIFT : Move Up / Down", 20, 80);
+            ctx.fillText("ARROWS      : Look around", 20, 100);
+
             requestAnimationFrame(draw);
         }
 
-        draw();
+        requestAnimationFrame(draw);
 
         window.addEventListener('resize', () => {
             width = window.innerWidth;
